@@ -65,6 +65,9 @@ integer compare, mask and variable shift being constant-time, which they are
 on x86-64 and AArch64, and on the compiler not turning a mask back into a
 branch, which nothing forbids, so like every such claim made in a language
 without constant-time semantics it is best-effort. It is not bitsliced.
+Because it is best-effort it is also measured: `zig build timing` runs the
+test from dudect against the release build on the machine at hand, and the
+section on tests below says how to read it.
 
 **The modes' length checks are assertions.** `dst.len >= src.len`, and a whole
 number of blocks for CBC and ECB, are checked in a Debug or ReleaseSafe build
@@ -124,6 +127,7 @@ makes them genuinely generic.
 ```console
 $ nix develop -c zig build test --summary all
 $ nix develop -c zig build fuzz-run -- --seconds 60
+$ nix develop -c zig build timing
 ```
 
 **Every vector was cross-checked against OpenSSL's legacy provider**, not
@@ -148,6 +152,19 @@ wrongly depends on how much plaintext follows. They also assert the properties
 no single vector can: that the parity bits never change the ciphertext, that
 three equal keys make 3DES into DES, and that a weak key is an involution, for
 every key and block rather than for one.
+
+`zig build timing` measures the constant-time claim instead of trusting it.
+It is the test from dudect: each of the cipher and the key helpers is timed on
+a fixed input and on random ones, hundreds of thousands of times in a random
+order, and Welch's t-test asks whether the two timing distributions can be
+told apart. A |t| above 10 is a leak, and at these sample counts that is a
+difference of about one cycle held consistently. A function whose running time
+*is* its input runs first, and the run fails if that control is not detected,
+so that a clean result means something. It reads the machine it runs on and
+the compiler that built it, which is exactly what the claim depends on and
+exactly what a disassembly read once cannot keep checking. Before the S-boxes
+were rewritten it reported the table lookup as a leak at |t| of 20; it now
+reports every function within 2.
 
 ## The API documentation
 

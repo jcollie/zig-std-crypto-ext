@@ -81,6 +81,41 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile everything without running it");
     check_step.dependOn(&fuzz_run.step);
 
+    // The constant-time claim, measured: `zig build timing` times the cipher
+    // and the key helpers on fixed and on random inputs and asks a t-test
+    // whether it can tell them apart. `tools/timing.zig` says how and what
+    // the numbers mean.
+    //
+    // It gets a library of its own rather than `mod`, because `mod` is built
+    // at whatever `-Doptimize` says, Debug by default, and a Debug build is
+    // not the one whose timing anybody cares about. This one is ReleaseFast
+    // for the host always, since the cycle counter it reads is the machine's.
+    const timing_des = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseFast,
+    });
+    const timing = b.addExecutable(.{
+        .name = "zig-des-timing",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/timing.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "des", .module = timing_des }},
+        }),
+    });
+    const run_timing = b.addRunArtifact(timing);
+    run_timing.stdio = .inherit;
+    if (b.args) |a| run_timing.addArgs(a);
+    const timing_step = b.step("timing", "Measure that the cipher and key helpers are constant-time");
+    timing_step.dependOn(&run_timing.step);
+    // Its statistics have tests of their own, and the check step keeps it
+    // compiling.
+    test_step.dependOn(&b.addRunArtifact(
+        b.addTest(.{ .root_module = timing.root_module }),
+    ).step);
+    check_step.dependOn(&timing.step);
+
     // -- documentation -------------------------------------------------------
     //
     // Zig emits the API documentation as a side effect of compiling, so the
