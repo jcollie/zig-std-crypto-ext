@@ -233,6 +233,7 @@ pub fn ecbDecrypt(
 const Des = des.Des;
 const Aes128 = std.crypto.core.aes.Aes128;
 const AesEncryptCtx = std.crypto.core.aes.AesEncryptCtx;
+const Aes192 = @import("aes192.zig").Aes192;
 
 test "DES-CBC against the NIST SP 800-38A style vector" {
     // Key and IV from the classic DES-CBC sample; three blocks of plaintext.
@@ -374,4 +375,85 @@ test "ECB is the raw cipher" {
     var chained: [16]u8 = undefined;
     cbcEncrypt(Des.EncryptCtx, Des.initEnc(key), &chained, &repeated, [_]u8{0} ** 8);
     try testing.expect(!std.mem.eql(u8, chained[0..8], chained[8..16]));
+}
+
+test "AES-192-CFB against NIST SP 800-38A F.3.15" {
+    // The key size `std.crypto` omits, driven through the same generic mode
+    // as the other two -- which is the whole argument for the mode being
+    // generic rather than tied to a cipher. Cisco's SNMPv3 privacy at 192
+    // bits is what wants it.
+    const key = [_]u8{
+        0x8e, 0x73, 0xb0, 0xf7, 0xda, 0x0e, 0x64, 0x52,
+        0xc8, 0x10, 0xf3, 0x2b, 0x80, 0x90, 0x79, 0xe5,
+        0x62, 0xf8, 0xea, 0xd2, 0x52, 0x2c, 0x6b, 0x7b,
+    };
+    const iv = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+    const plaintext = [_]u8{
+        0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+        0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+        0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c,
+        0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+    };
+    const expected = [_]u8{
+        0xcd, 0xc8, 0x0d, 0x6f, 0xdd, 0xf1, 0x8c, 0xab,
+        0x34, 0xc2, 0x59, 0x09, 0xc9, 0x9a, 0x41, 0x74,
+        0x67, 0xce, 0x7f, 0x7f, 0x81, 0x17, 0x36, 0x21,
+        0x96, 0x1a, 0x2b, 0x70, 0x17, 0x1d, 0x3d, 0x7a,
+    };
+
+    var ciphertext: [32]u8 = undefined;
+    cfbEncrypt(Aes192.EncryptCtx, Aes192.initEnc(key), &ciphertext, &plaintext, iv);
+    try testing.expectEqualSlices(u8, &expected, &ciphertext);
+
+    // And back, with an *encryption* context -- there is no AES-192
+    // decryption context in this library, and CFB needs none.
+    var back: [32]u8 = undefined;
+    cfbDecrypt(Aes192.EncryptCtx, Aes192.initEnc(key), &back, &ciphertext, iv);
+    try testing.expectEqualSlices(u8, &plaintext, &back);
+}
+
+test "AES-192-CFB at every length, and in place" {
+    const key = [_]u8{0x3c} ** 24;
+    const iv = [_]u8{0x9e} ** 16;
+    for ([_]usize{ 1, 15, 16, 17, 31, 33, 64 }) |len| {
+        const plaintext = ([_]u8{0x5a} ** 64)[0..len];
+        var ciphertext: [64]u8 = undefined;
+        cfbEncrypt(Aes192.EncryptCtx, Aes192.initEnc(key), ciphertext[0..len], plaintext, iv);
+        var back: [64]u8 = undefined;
+        cfbDecrypt(Aes192.EncryptCtx, Aes192.initEnc(key), back[0..len], ciphertext[0..len], iv);
+        try testing.expectEqualSlices(u8, plaintext, back[0..len]);
+
+        // In place, which is how a datagram is decrypted where it landed.
+        var scratch: [64]u8 = undefined;
+        @memcpy(scratch[0..len], plaintext);
+        cfbEncrypt(Aes192.EncryptCtx, Aes192.initEnc(key), scratch[0..len], scratch[0..len], iv);
+        try testing.expectEqualSlices(u8, ciphertext[0..len], scratch[0..len]);
+    }
+}
+
+test "the three AES key sizes give three different ciphertexts" {
+    // A mode that silently used the wrong key schedule would still
+    // round-trip, so this pins that the key length actually selects the
+    // cipher -- which is exactly the mistake that would make an AES-256
+    // SNMPv3 session appear to work against a permissive agent.
+    const iv = [_]u8{0x11} ** 16;
+    const plaintext = [_]u8{0xa5} ** 16;
+    var out128: [16]u8 = undefined;
+    var out192: [16]u8 = undefined;
+    var out256: [16]u8 = undefined;
+    cfbEncrypt(AesEncryptCtx(Aes128), Aes128.initEnc(@splat(0x2b)), &out128, &plaintext, iv);
+    cfbEncrypt(Aes192.EncryptCtx, Aes192.initEnc(@splat(0x2b)), &out192, &plaintext, iv);
+    cfbEncrypt(
+        AesEncryptCtx(std.crypto.core.aes.Aes256),
+        std.crypto.core.aes.Aes256.initEnc(@splat(0x2b)),
+        &out256,
+        &plaintext,
+        iv,
+    );
+    try testing.expect(!std.mem.eql(u8, &out128, &out192));
+    try testing.expect(!std.mem.eql(u8, &out192, &out256));
+    try testing.expect(!std.mem.eql(u8, &out128, &out256));
 }

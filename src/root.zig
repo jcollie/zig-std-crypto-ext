@@ -55,11 +55,16 @@ const testing = std.testing;
 /// this module as `des` does not have to write `des.des.Des`.
 pub const cipher = @import("des.zig");
 pub const modes = @import("modes.zig");
+/// AES-192, which `std.crypto` omits: it ships Aes128 and Aes256 and nothing
+/// between. Encryption only, because CFB and CTR never run a cipher
+/// backwards -- the file says more.
+pub const aes192 = @import("aes192.zig");
 
 /// The pieces a caller reaches for most often, spelled without the layer in
 /// between.
 pub const Des = cipher.Des;
 pub const Des3 = cipher.Des3;
+pub const Aes192 = aes192.Aes192;
 pub const weak_keys = cipher.weak_keys;
 pub const isWeak = cipher.isWeak;
 pub const hasOddParity = cipher.hasOddParity;
@@ -72,4 +77,5 @@ test {
     // only through a reference to it.
     _ = cipher;
     _ = modes;
+    _ = aes192;
 }

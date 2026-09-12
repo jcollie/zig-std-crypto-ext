@@ -29,6 +29,7 @@ const Des = des.Des;
 const Des3 = des.Des3;
 const modes = des.modes;
 const Aes128 = std.crypto.core.aes.Aes128;
+const Aes192 = des.Aes192;
 const AesEncryptCtx = std.crypto.core.aes.AesEncryptCtx;
 
 /// Unused here -- nothing in this library allocates -- but the standalone
@@ -117,6 +118,21 @@ fn cfbProperty(input: []const u8) !void {
     try testing.expectEqualSlices(u8, buffer[0..len], scratch[0..len]);
     modes.cfbDecrypt(AesEncryptCtx(Aes128), Aes128.initEnc(key), scratch[0..len], scratch[0..len], iv);
     try testing.expectEqualSlices(u8, plaintext, scratch[0..len]);
+
+    // AES-192 through the same mode, because it is this library's own cipher
+    // rather than std's and so has nobody else's test suite behind it.
+    if (input.len >= 24 + block_length) {
+        const key192 = input[0..24].*;
+        const iv192 = input[24..][0..block_length].*;
+        const body = input[24 + block_length ..];
+        if (body.len <= buffer.len) {
+            var enc: [4096]u8 = undefined;
+            modes.cfbEncrypt(Aes192.EncryptCtx, Aes192.initEnc(key192), enc[0..body.len], body, iv192);
+            var dec: [4096]u8 = undefined;
+            modes.cfbDecrypt(Aes192.EncryptCtx, Aes192.initEnc(key192), dec[0..body.len], enc[0..body.len], iv192);
+            try testing.expectEqualSlices(u8, body, dec[0..body.len]);
+        }
+    }
 
     // A prefix of the plaintext must encrypt to a prefix of the ciphertext:
     // CFB is a stream mode, so the keystream cannot depend on how much comes

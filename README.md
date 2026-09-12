@@ -5,8 +5,8 @@ SPDX-License-Identifier: MIT
 
 # zig-des
 
-DES, Triple DES, and the block cipher modes `std.crypto` leaves out — CBC, CFB
-and ECB, generic over any block cipher.
+DES, Triple DES, **AES-192**, and the block cipher modes `std.crypto` leaves
+out — CBC, CFB and ECB, generic over any block cipher.
 
 The API documentation is generated from the doc comments, which carry most of
 the explanation, and is published at
@@ -87,6 +87,7 @@ zeroed on return while the contexts, being the caller's, are not.
 | `modes.cbcEncrypt`, `cbcDecrypt` | Cipher Block Chaining. Whole blocks only; choosing a padding is the caller's business, because the padding belongs to whatever specification sent them here. |
 | `modes.cfbEncrypt`, `cfbDecrypt` | Cipher Feedback with full-block feedback — "CFB128" for a 128-bit cipher. A stream mode, so any length, and it runs the cipher *forwards* in both directions, so both take an encryption context. |
 | `modes.ecbEncrypt`, `ecbDecrypt` | Each block alone. Leaks which plaintext blocks are equal; present because key-wrapping constructions and test vectors are stated in terms of it. |
+| `Aes192` | AES-192, the key size `std.crypto` omits — it ships `Aes128` and `Aes256` and nothing between. **Encryption only**, because CFB and CTR never run a cipher backwards; `initDec` is deliberately absent, so asking for it is a compile error rather than a surprise. |
 | `weak_keys`, `isWeak` | The four keys for which DES is an involution. A password-derived key can be one by accident, and `usmDESPrivProtocol` derives its key from a password. |
 | `hasOddParity`, `setOddParity` | The parity convention DES keys are distributed under. The cipher ignores the parity bits entirely — that is what "56-bit key" means. |
 
