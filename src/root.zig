@@ -23,9 +23,10 @@
 //!
 //! // And the same mode machinery over AES, because it is generic over the
 //! // cipher rather than tied to this library's.
-//! const Aes128 = std.crypto.core.aes.Aes128;
+//! const aes = std.crypto.core.aes;
 //! des.modes.cfbEncrypt(
-//!     Aes128.EncryptCtx, Aes128.initEnc(aes_key), &out, plaintext, aes_iv,
+//!     aes.AesEncryptCtx(aes.Aes128), aes.Aes128.initEnc(aes_key),
+//!     &out, plaintext, aes_iv,
 //! );
 //! ```
 //!
@@ -42,7 +43,10 @@
 //! Single DES is brute-forceable and has been since 1998, Triple DES has a
 //! 64-bit block and so a birthday bound at 32 GiB, and CBC and CFB
 //! authenticate nothing. Everything here is for talking to something that
-//! already exists.
+//! already exists. What it does promise is spelled out in the same two
+//! places: the cipher is constant-time in the key and the data, on the
+//! assumptions `Des` names, and the modes' length checks are assertions,
+//! which `modes` says the consequences of.
 
 const std = @import("std");
 const testing = std.testing;

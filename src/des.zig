@@ -34,6 +34,23 @@
 //!
 //! It is all fixed tables, so it is all in this file, and each table says
 //! which one it is in FIPS 46-3's numbering.
+//!
+//! ## Timing
+//!
+//! Every operation here takes the same time whatever the key and the block.
+//! The permutation tables are only ever read at constant indices, every loop
+//! runs a fixed number of times, and the S-boxes -- the one place a DES
+//! implementation normally reads memory at a key-dependent address, which is
+//! the cache-timing attack of Tsunoo et al. (2003) -- are evaluated by `sbox`
+//! with masks and a shift rather than a lookup. What that rests on is that
+//! integer compare, mask and variable-distance shift are constant-time, which
+//! they are on x86-64 and AArch64 and which is the same assumption
+//! `std.crypto` makes; and that the compiler does not turn a mask into a
+//! branch, which nothing forbids it to do, so like every constant-time claim
+//! made in a language without constant-time semantics this one is
+//! best-effort. It is not bitsliced. The key helpers `hasOddParity`,
+//! `setOddParity` and `isWeak` are written the same way, since the key is what
+//! they are given.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -46,6 +63,12 @@ const testing = std.testing;
 // the top when it uses them. Transcribing them the other way round is the
 // classic way to get a DES that is self-consistent and wrong, so they are
 // left exactly as published and the conversion happens in `permute`.
+//
+// Each is checked at compile time, at the end of this section, for the
+// property it is supposed to have: a transcription error that repeats or
+// omits a bit produces a cipher that still round-trips, and an entry outside
+// the input width would make `permute` shift by more than there is, which is
+// a panic in a safe build and undefined behaviour in a fast one.
 
 /// IP, the initial permutation. 64 bits to 64.
 const initial_permutation = [64]u8{
@@ -109,7 +132,8 @@ const key_permutation_1 = [56]u8{
 };
 
 /// PC-2, the permuted choice that picks each round's 48-bit subkey out of the
-/// 56-bit rotating register.
+/// 56-bit rotating register. The eight bits it leaves out are 9, 18, 22, 25,
+/// 35, 38, 43 and 54.
 const key_permutation_2 = [48]u8{
     14, 17, 11, 24, 1,  5,
     3,  28, 15, 6,  21, 10,
@@ -133,7 +157,7 @@ const key_rotations = [16]u3{ 1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1 };
 /// the single most common way to write a DES that round-trips perfectly and
 /// produces the wrong ciphertext -- which is exactly what happened here, and
 /// what the known-answer tests caught. `s_boxes` below does the shuffle once
-/// at compile time so that the round function can index by the input value
+/// at compile time so that the rest of the file can index by the input value
 /// directly.
 const s_boxes_published = [8][64]u8{
     .{
@@ -190,9 +214,10 @@ const s_boxes_published = [8][64]u8{
 ///
 /// The published row is `(b1 b6)` and the column `(b2 b3 b4 b5)`, so for an
 /// input `b1..b6` the published entry lives at `row * 16 + column`. Doing that
-/// arithmetic here rather than in `feistel` keeps the hot path a single array
-/// index and keeps the tables above verbatim as printed, which is what makes
-/// them checkable against the standard.
+/// arithmetic here keeps the tables above verbatim as printed, which is what
+/// makes them checkable against the standard. The round function does not
+/// read this table -- see `s_boxes_packed` for why -- but it is what that
+/// table is built from and what the tests check it against.
 const s_boxes = blk: {
     var boxes: [8][64]u8 = undefined;
     for (s_boxes_published, 0..) |published, box| {
@@ -204,6 +229,93 @@ const s_boxes = blk: {
     }
     break :blk boxes;
 };
+
+/// The same eight boxes once more, packed sixteen nibbles to a word, so that
+/// the round function can pick an entry without reading memory at an address
+/// that depends on the key.
+///
+/// Word `w` of a box holds the entries for inputs `16w` to `16w + 15`, and
+/// within it input `j` sits in bits `4j` to `4j + 3`. `sbox` selects the word
+/// with masks and the nibble with a shift, which is the whole of the
+/// constant-time claim made at the top of this file.
+const s_boxes_packed = blk: {
+    var boxes: [8][4]u64 = @splat(@splat(0));
+    for (s_boxes, 0..) |box, b| {
+        for (box, 0..) |entry, six| {
+            boxes[b][six / 16] |= @as(u64, entry) << ((six % 16) * 4);
+        }
+    }
+    break :blk boxes;
+};
+
+// The checks. Each is a `@compileError` naming the table, so that a slip in
+// transcription is a build failure that says where rather than a wrong
+// ciphertext that says nothing.
+
+/// `table` names distinct bits of an `in_bits` wide value, and the bits it
+/// leaves out are exactly `omitted`. With nothing omitted it is a permutation.
+fn checkSelection(comptime name: []const u8, comptime table: []const u8, comptime in_bits: usize, comptime omitted: []const u8) void {
+    var seen = [_]bool{false} ** (in_bits + 1);
+    for (table) |bit| {
+        if (bit < 1 or bit > in_bits) @compileError(name ++ ": entry out of range");
+        if (seen[bit]) @compileError(name ++ ": repeats a bit");
+        seen[bit] = true;
+    }
+    for (1..in_bits + 1) |bit| {
+        var is_omitted = false;
+        for (omitted) |o| is_omitted = is_omitted or o == bit;
+        if (seen[bit] == is_omitted) @compileError(name ++ ": omits the wrong bits");
+    }
+}
+
+comptime {
+    // The checks are a few thousand simple steps, which is over the default.
+    @setEvalBranchQuota(20_000);
+    checkSelection("IP", &initial_permutation, 64, &.{});
+    checkSelection("IP^-1", &final_permutation, 64, &.{});
+    checkSelection("P", &round_permutation, 32, &.{});
+    checkSelection("PC-1", &key_permutation_1, 64, &.{ 8, 16, 24, 32, 40, 48, 56, 64 });
+    checkSelection("PC-2", &key_permutation_2, 56, &.{ 9, 18, 22, 25, 35, 38, 43, 54 });
+
+    // E names every bit of the 32, and doubles exactly the ones either side of
+    // each four-bit group: bit 4n and bit 4n+1.
+    var times = [_]u8{0} ** 33;
+    for (expansion) |bit| {
+        if (bit < 1 or bit > 32) @compileError("E: entry out of range");
+        times[bit] += 1;
+    }
+    for (1..33) |bit| {
+        const expected: u8 = if (bit % 4 == 0 or bit % 4 == 1) 2 else 1;
+        if (times[bit] != expected) @compileError("E: wrong bit doubled");
+    }
+
+    // IP^-1 undoes IP.
+    for (initial_permutation, 1..) |from, to| {
+        if (final_permutation[from - 1] != to) @compileError("IP^-1 does not undo IP");
+    }
+
+    // The register comes back round after sixteen rounds.
+    var total = 0;
+    for (key_rotations) |r| total += r;
+    if (total != 28) @compileError("key rotations do not sum to 28");
+
+    // Each S-box row is a permutation of 0..15, as printed.
+    for (s_boxes_published) |box| {
+        for (0..4) |row| {
+            var seen = [_]bool{false} ** 16;
+            for (box[row * 16 ..][0..16]) |v| {
+                if (v > 15) @compileError("S-box entry out of range");
+                if (seen[v]) @compileError("S-box row repeats a value");
+                seen[v] = true;
+            }
+        }
+    }
+
+    // And the weak keys are written with odd parity, which `isWeak` relies on.
+    for (weak_keys) |key| {
+        if (!hasOddParity(&key)) @compileError("a weak key is written without odd parity");
+    }
+}
 
 // -- the machinery ----------------------------------------------------------
 
@@ -237,6 +349,21 @@ fn schedule(key: [8]u8) [16]u48 {
     return keys;
 }
 
+/// S-box `box` applied to the six-bit `six`, without a data-dependent memory
+/// access: the word that holds the entry is chosen by ANDing each of the four
+/// against a mask that is all ones for exactly one of them, and the entry is
+/// shifted out of that.
+inline fn sbox(comptime box: usize, six: u6) u4 {
+    const hi: u2 = @intCast(six >> 4);
+    var word: u64 = 0;
+    inline for (s_boxes_packed[box], 0..) |candidate, w| {
+        const mask: u64 = 0 -% @as(u64, @intFromBool(hi == w));
+        word |= candidate & mask;
+    }
+    const shift: u6 = @as(u6, @as(u4, @truncate(six))) * 4;
+    return @truncate(word >> shift);
+}
+
 /// The Feistel round function: expand, mix in the key, substitute, permute.
 fn feistel(right: u32, round_key: u48) u32 {
     const expanded = permute(48, 32, &expansion, right) ^ @as(u64, round_key);
@@ -244,9 +371,7 @@ fn feistel(right: u32, round_key: u48) u32 {
     inline for (0..8) |box| {
         // Six bits at a time, most significant group first.
         const six: u6 = @truncate(expanded >> @intCast(42 - box * 6));
-        // `s_boxes` is indexed by the input value, the row/column shuffle
-        // having been done at compile time.
-        substituted = (substituted << 4) | s_boxes[box][six];
+        substituted = (substituted << 4) | sbox(box, six);
     }
     return @truncate(permute(32, 32, &round_permutation, substituted));
 }
@@ -272,6 +397,10 @@ fn crypt(keys: *const [16]u48, block: u64) u64 {
 // -- DES --------------------------------------------------------------------
 
 /// Single DES: a 64-bit key of which 56 bits matter, and a 64-bit block.
+///
+/// A context holds the sixteen expanded round keys and has no `deinit`. A
+/// caller who wants them gone when finished zeroes the context with
+/// `std.crypto.secureZero`, as with `std.crypto.core.aes`.
 pub const Des = struct {
     pub const key_length = 8;
     pub const block_length = 8;
@@ -298,18 +427,17 @@ pub const Des = struct {
         }
     };
 
+    /// Deliberately has no `encrypt`: CFB and CTR run the cipher forwards to
+    /// decrypt and so take an `EncryptCtx`, and a decryption context that
+    /// answered to `encrypt` would let them compile with the schedule
+    /// reversed -- producing ciphertext that round-trips with itself and that
+    /// nothing else can read.
     pub const DecryptCtx = struct {
         pub const block_length = Des.block_length;
         keys: [16]u48,
 
         pub fn decrypt(ctx: DecryptCtx, dst: *[Des.block_length]u8, src: *const [Des.block_length]u8) void {
             std.mem.writeInt(u64, dst, crypt(&ctx.keys, std.mem.readInt(u64, src, .big)), .big);
-        }
-
-        /// So that a decryption context can drive a mode that only ever
-        /// encrypts, which CFB and CTR both do.
-        pub fn encrypt(ctx: DecryptCtx, dst: *[Des.block_length]u8, src: *const [Des.block_length]u8) void {
-            ctx.decrypt(dst, src);
         }
     };
 };
@@ -321,6 +449,10 @@ pub const Des = struct {
 /// that setting all three keys equal makes this identical to single DES, which
 /// is how the hardware of the day stayed compatible. Two-key 3DES is this with
 /// the third key equal to the first.
+///
+/// As with `Des`, a context holds the expanded round keys -- forty-eight of
+/// them here -- and a caller who wants them gone zeroes it with
+/// `std.crypto.secureZero`.
 pub const Des3 = struct {
     pub const key_length = 24;
     pub const block_length = 8;
@@ -399,20 +531,23 @@ pub const Des3 = struct {
 ///
 /// Nothing in the cipher cares -- the parity bits are discarded by PC-1 -- so
 /// this is for a caller that wants to check a key it was given, or to fix one
-/// up before handing it to hardware that does care.
+/// up before handing it to hardware that does care. It looks at every byte
+/// rather than stopping at the first even one, so that how long it takes says
+/// nothing about the key.
 pub fn hasOddParity(key: []const u8) bool {
-    for (key) |byte| if (@popCount(byte) % 2 == 0) return false;
-    return true;
+    var all_odd: u8 = 1;
+    for (key) |byte| all_odd &= @popCount(byte) & 1;
+    return all_odd == 1;
 }
 
 /// `key` with each byte's low bit set so that the byte has odd parity.
+///
+/// The parity of the other seven bits is key material, so this is done with
+/// arithmetic rather than a branch on it.
 pub fn setOddParity(key: []u8) void {
     for (key) |*byte| {
-        if (@popCount(byte.* & 0xfe) % 2 == 0) {
-            byte.* |= 1;
-        } else {
-            byte.* &= 0xfe;
-        }
+        const parity: u8 = @popCount(byte.* & 0xfe) & 1;
+        byte.* = (byte.* & 0xfe) | (parity ^ 1);
     }
 }
 
@@ -429,15 +564,19 @@ pub const weak_keys = [4][8]u8{
 };
 
 /// Whether `key` is one of `weak_keys`, ignoring parity bits.
+///
+/// Only the four weak keys: not the twelve semi-weak ones, which pair up into
+/// keys that undo each other and which OpenSSL's `DES_set_key_checked` also
+/// refuses. The comparison is constant-time and looks at all four, since the
+/// key is a secret and this is the function called on it while it is fresh.
 pub fn isWeak(key: [8]u8) bool {
     var normalized = key;
     setOddParity(&normalized);
+    var hit: u8 = 0;
     for (weak_keys) |weak| {
-        var candidate = weak;
-        setOddParity(&candidate);
-        if (std.mem.eql(u8, &normalized, &candidate)) return true;
+        hit |= @intFromBool(std.crypto.timing_safe.eql([8]u8, normalized, weak));
     }
-    return false;
+    return hit != 0;
 }
 
 // -- tests ------------------------------------------------------------------
@@ -499,36 +638,45 @@ test "triple DES with three equal keys is single DES" {
     try expectBlock(Des3, &(key ++ key ++ key), 0x0123456789abcdef, 0x85e813540f0ab405);
 }
 
-test "triple DES, and the two-key form" {
-    // NIST SP 800-20 style: three distinct keys.
+test "the NIST SP 800-67 known answer" {
+    // Appendix B of SP 800-67: three distinct keys over three blocks of
+    // plaintext, whose misspelling is the standard's own. A round trip would
+    // pass with k1 and k3 swapped in both directions; this does not.
+    // Confirmed against OpenSSL: -des-ede3 -nopad.
     const key3 = [24]u8{
         0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
         0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01,
         0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23,
     };
+    const plaintext = "The qufck brown fox jump";
+    const expected = [3]u64{ 0xa826fd8ce53b855f, 0xcce21c8112256fe6, 0x68d5c05dd9b6b900 };
+    for (expected, 0..) |c, i| {
+        try expectBlock(Des3, &key3, std.mem.readInt(u64, plaintext[i * 8 ..][0..8], .big), c);
+    }
+}
+
+test "two-key triple DES" {
+    // OpenSSL -des-ede -nopad, with the first two keys of the SP 800-67
+    // vector. The three-key form with k3 = k1 gives the same answer there, and
+    // the two spellings must agree here too.
+    const key2 = [16]u8{
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01,
+    };
     var p: [8]u8 = undefined;
     std.mem.writeInt(u64, &p, 0x0123456789abcdef, .big);
-    var c: [8]u8 = undefined;
-    Des3.initEnc(key3).encrypt(&c, &p);
-    var back: [8]u8 = undefined;
-    Des3.initDec(key3).decrypt(&back, &c);
-    try testing.expectEqualSlices(u8, &p, &back);
-
-    // Two-key 3DES is the three-key form with k3 = k1, so the two spellings
-    // must agree exactly.
-    const key2 = key3[0..16].*;
     var c2: [8]u8 = undefined;
     Des3.initEnc2(key2).encrypt(&c2, &p);
+    try testing.expectEqual(@as(u64, 0xa6bb373e196b375e), std.mem.readInt(u64, &c2, .big));
+
+    var back: [8]u8 = undefined;
+    Des3.initDec2(key2).decrypt(&back, &c2);
+    try testing.expectEqualSlices(u8, &p, &back);
+
     var expanded: [24]u8 = undefined;
     @memcpy(expanded[0..16], &key2);
     @memcpy(expanded[16..24], key2[0..8]);
-    var c3: [8]u8 = undefined;
-    Des3.initEnc(expanded).encrypt(&c3, &p);
-    try testing.expectEqualSlices(u8, &c3, &c2);
-
-    var back2: [8]u8 = undefined;
-    Des3.initDec2(key2).decrypt(&back2, &c2);
-    try testing.expectEqualSlices(u8, &p, &back2);
+    try expectBlock(Des3, &expanded, 0x0123456789abcdef, 0xa6bb373e196b375e);
 }
 
 test "the parity bits are not part of the key" {
@@ -552,11 +700,20 @@ test "parity helpers" {
     // are.
     try testing.expect(hasOddParity(&.{ 0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1 }));
     try testing.expect(!hasOddParity(&([_]u8{0x00} ** 8)));
+    // An even byte anywhere, not only first.
+    try testing.expect(!hasOddParity(&.{ 0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf0 }));
 
     var key = [_]u8{0x00} ** 8;
     setOddParity(&key);
     try testing.expect(hasOddParity(&key));
     try testing.expectEqualSlices(u8, &([_]u8{0x01} ** 8), &key);
+    // And every byte value, both ways round.
+    for (0..256) |v| {
+        var byte = [1]u8{@intCast(v)};
+        setOddParity(&byte);
+        try testing.expect(hasOddParity(&byte));
+        try testing.expectEqual(@as(u8, @intCast(v & 0xfe)), byte[0] & 0xfe);
+    }
 }
 
 test "the weak keys are involutions" {
@@ -575,48 +732,34 @@ test "the weak keys are involutions" {
     }
     try testing.expect(!isWeak(.{ 0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1 }));
     // Parity is ignored when deciding, so the all-zero key is the all-ones
-    // parity spelling of the first weak key.
+    // parity spelling of the first weak key, and each of the others has an
+    // even-parity spelling too.
     try testing.expect(isWeak([_]u8{0x00} ** 8));
+    for (weak_keys) |key| {
+        var respelled = key;
+        for (&respelled) |*byte| byte.* ^= 1;
+        try testing.expect(isWeak(respelled));
+    }
+    // A key one bit off a weak key, in a bit that matters, is not weak.
+    try testing.expect(!isWeak(.{ 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x03 }));
 }
 
-test "the permutations are permutations" {
-    // A table that repeats or omits a bit is the classic transcription error,
-    // and it produces a cipher that still round-trips. IP and its inverse are
-    // bijections on 64 bits; E and PC-2 are expansions and selections and so
-    // are checked for range only.
-    inline for (.{ &initial_permutation, &final_permutation }) |table| {
-        var seen = [_]bool{false} ** 65;
-        for (table) |bit| {
-            try testing.expect(bit >= 1 and bit <= 64);
-            try testing.expect(!seen[bit]);
-            seen[bit] = true;
+test "the packed S-boxes are the S-boxes" {
+    // `sbox` must agree with the plain re-indexed table for every input;
+    // the known-answer tests then cover everything downstream of it.
+    inline for (0..8) |box| {
+        for (0..64) |six| {
+            try testing.expectEqual(s_boxes[box][six], sbox(box, @intCast(six)));
         }
     }
-    // And IP^-1 really does undo IP.
+}
+
+test "IP^-1 undoes IP on live data" {
+    // The tables are checked against each other at compile time; this checks
+    // `permute` applies them the way the check assumed.
     for (0..64) |i| {
         const block = @as(u64, 1) << @intCast(i);
         const there = permute(64, 64, &initial_permutation, block);
         try testing.expectEqual(block, permute(64, 64, &final_permutation, there));
-    }
-    // PC-1 selects 56 distinct bits, and never a parity bit.
-    var seen = [_]bool{false} ** 65;
-    for (key_permutation_1) |bit| {
-        try testing.expect(bit >= 1 and bit <= 64);
-        try testing.expect(bit % 8 != 0);
-        try testing.expect(!seen[bit]);
-        seen[bit] = true;
-    }
-    // The rotations sum to 28, so the register comes back round.
-    var total: usize = 0;
-    for (key_rotations) |r| total += r;
-    try testing.expectEqual(@as(usize, 28), total);
-    // Each S-box is a map onto 0..15, four times over.
-    for (s_boxes_published) |box| {
-        var counts = [_]usize{0} ** 16;
-        for (box) |v| {
-            try testing.expect(v <= 15);
-            counts[v] += 1;
-        }
-        for (counts) |c| try testing.expectEqual(@as(usize, 4), c);
     }
 }

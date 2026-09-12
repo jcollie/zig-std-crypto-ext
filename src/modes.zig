@@ -27,6 +27,28 @@
 //! padding oracles. Use them where a specification requires them and pair them
 //! with a MAC -- which is what SNMPv3 does, computing an HMAC over the whole
 //! message.
+//!
+//! ## The contracts
+//!
+//! Every function here asserts what it needs of its lengths: `dst.len >=
+//! src.len` always, and `src.len` a whole number of blocks for CBC and ECB.
+//! An assertion is a check in a Debug or ReleaseSafe build and nothing at all
+//! in ReleaseFast or ReleaseSmall, where a violation reads past the end of
+//! `src` and writes past the end of `dst`. The length of a ciphertext comes
+//! off the wire in the protocols these are for, so a caller checks it before
+//! calling rather than relying on this to. `std.crypto.modes.ctr` and the
+//! AEADs in `std` behave the same way.
+//!
+//! `dst` may be the very same slice as `src` -- decrypting a datagram where it
+//! landed is the normal thing to do -- or one that does not overlap it. A
+//! partial overlap overwrites blocks that have not been read yet and is not
+//! detected. Working in place also asks the block cipher to tolerate `dst ==
+//! src` over a single block, which `Des`, `Des3` and `std.crypto.core.aes`
+//! all do by reading the whole block before writing any of it.
+//!
+//! The mode's own temporaries -- a keystream block, a block of plaintext
+//! about to be encrypted -- are zeroed before returning. The contexts are the
+//! caller's, and `Des` says what to do with those.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -44,7 +66,8 @@ const des = @import("des.zig");
 /// partial one, and choosing a padding is the caller's business because the
 /// padding is part of whatever specification sent them here. SNMPv3 pads with
 /// whatever is convenient and relies on the BER length inside the plaintext to
-/// say where the real data stops.
+/// say where the real data stops. That, and `dst.len >= src.len`, are
+/// asserted only: see the contracts above.
 pub fn cbcEncrypt(
     comptime BlockCipher: anytype,
     block_cipher: BlockCipher,
@@ -57,9 +80,10 @@ pub fn cbcEncrypt(
     assert(dst.len >= src.len);
 
     var previous = iv;
+    var block: [block_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &block);
     var i: usize = 0;
     while (i < src.len) : (i += block_length) {
-        var block: [block_length]u8 = undefined;
         for (&block, src[i..][0..block_length], previous) |*out, plain, chain| {
             out.* = plain ^ chain;
         }
@@ -70,6 +94,10 @@ pub fn cbcEncrypt(
 
 /// Cipher Block Chaining, decrypting. Needs a *decryption* context, unlike
 /// CFB and CTR.
+///
+/// `src.len` must be a whole number of blocks and `dst.len >= src.len`, and
+/// both are asserted only: a ciphertext length that came off the wire is
+/// checked before it gets here. See the contracts above.
 pub fn cbcDecrypt(
     comptime BlockCipher: anytype,
     block_cipher: BlockCipher,
@@ -104,7 +132,8 @@ pub fn cbcDecrypt(
 ///
 /// Being a stream mode, it needs no padding and `src.len` need not be a whole
 /// number of blocks -- the last partial block simply uses as much of the
-/// keystream as it needs.
+/// keystream as it needs. `dst.len >= src.len` is asserted only: see the
+/// contracts above.
 pub fn cfbEncrypt(
     comptime BlockCipher: anytype,
     block_cipher: BlockCipher,
@@ -117,6 +146,7 @@ pub fn cfbEncrypt(
 
     var feedback = iv;
     var keystream: [block_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &keystream);
     var i: usize = 0;
     while (i < src.len) : (i += block_length) {
         block_cipher.encrypt(&keystream, &feedback);
@@ -131,6 +161,7 @@ pub fn cfbEncrypt(
 }
 
 /// CFB, decrypting. Takes an **encryption** context: see `cfbEncrypt`.
+/// `dst.len >= src.len` is asserted only: see the contracts above.
 pub fn cfbDecrypt(
     comptime BlockCipher: anytype,
     block_cipher: BlockCipher,
@@ -143,6 +174,7 @@ pub fn cfbDecrypt(
 
     var feedback = iv;
     var keystream: [block_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &keystream);
     var i: usize = 0;
     while (i < src.len) : (i += block_length) {
         block_cipher.encrypt(&keystream, &feedback);
@@ -162,6 +194,9 @@ pub fn cfbDecrypt(
 /// encrypt a message. It is here because key-wrapping constructions and test
 /// vectors are stated in terms of it, and because writing it out is better
 /// than a caller reaching for the raw context and getting the loop wrong.
+///
+/// `src.len` must be a whole number of blocks and `dst.len >= src.len`, both
+/// asserted only: see the contracts above.
 pub fn ecbEncrypt(
     comptime BlockCipher: anytype,
     block_cipher: BlockCipher,
@@ -177,6 +212,7 @@ pub fn ecbEncrypt(
     }
 }
 
+/// ECB, decrypting. The same contracts as `ecbEncrypt`.
 pub fn ecbDecrypt(
     comptime BlockCipher: anytype,
     block_cipher: BlockCipher,
@@ -214,6 +250,27 @@ test "DES-CBC against the NIST SP 800-38A style vector" {
 
     var back: [24]u8 = undefined;
     cbcDecrypt(Des.DecryptCtx, Des.initDec(key), &back, &ciphertext, iv);
+    try testing.expectEqualSlices(u8, plaintext, &back);
+}
+
+test "DES-CFB against OpenSSL" {
+    // The CBC vector's key, IV and plaintext through `openssl enc -des-cfb
+    // -nopad`: the one DES-CFB answer in the tree, so that the mode is pinned
+    // over this cipher and not only over AES.
+    const key = [_]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+    const iv = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
+    const plaintext = "Now is the time for all ";
+
+    var ciphertext: [24]u8 = undefined;
+    cfbEncrypt(Des.EncryptCtx, Des.initEnc(key), &ciphertext, plaintext, iv);
+    try testing.expectEqualSlices(u8, &.{
+        0xf3, 0x09, 0x62, 0x49, 0xc7, 0xf4, 0x6e, 0x51,
+        0xa6, 0x9e, 0x83, 0x9b, 0x1a, 0x92, 0xf7, 0x84,
+        0x03, 0x46, 0x71, 0x33, 0x89, 0x8e, 0xa6, 0x22,
+    }, &ciphertext);
+
+    var back: [24]u8 = undefined;
+    cfbDecrypt(Des.EncryptCtx, Des.initEnc(key), &back, &ciphertext, iv);
     try testing.expectEqualSlices(u8, plaintext, &back);
 }
 

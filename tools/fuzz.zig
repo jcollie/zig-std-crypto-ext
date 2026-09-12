@@ -19,9 +19,9 @@
 //!
 //! ```console
 //! $ zig build fuzz-run                                # a minute of each
-//! $ zig build fuzz-run -- --seconds 300 --target messages
+//! $ zig build fuzz-run -- --seconds 300 --target cfb
 //! $ zig build fuzz-run -- --seed 12345                # exactly again
-//! $ zig build fuzz-run -- --input fuzz-findings/x.bin --target messages
+//! $ zig build fuzz-run -- --input fuzz-findings/x.bin --target cfb
 //! ```
 //!
 //! # What an input is
@@ -39,33 +39,28 @@
 //!   rather than reducing it. For an `i64` every value is in range; for a
 //!   `bool` only 0 and 1 are, so random bytes make it false every time.
 //!
-//! Every target here begins with a `slice`, so `makeInput` writes two
-//! length-prefixed chunks -- two because a target may ask for two slices, and
-//! the second would otherwise only ever see the random tail -- and each chunk
-//! is a mutation of one of the target's own seeds. That corpus is the whole of
-//! what stands in for coverage feedback.
+//! Every target here reads one `slice` and takes its key, IV and plaintext
+//! out of it, so `makeInput` writes one length-prefixed chunk, a mutation of
+//! one of the target's own seeds, and a random tail for anything asked after
+//! it. That corpus is the whole of what stands in for coverage feedback.
 //!
 //! The length is capped at the target's own buffer size, which `Target` has to
 //! carry for the reason above: a length larger than the buffer yields nothing
 //! rather than a truncation, and getting it wrong is silent -- the target
 //! runs, reports no failure, and was handed the empty string every time.
 //!
-//! # Two kinds of input
-//!
-//! LDAP has both, which is why `Target` says which it is. A filter, a
-//! distinguished name and a URL are text, and mutate best towards the
-//! punctuation their grammars are made of. A message is BER, and mutates best
-//! towards tag and length bytes: a run of random bytes is not a message and
-//! never becomes one, whereas a real message with one length byte changed is
-//! exactly the input worth trying.
+//! The mutations lean towards the bytes a cipher is most likely to mishandle:
+//! all zeros and all ones, and the bytes the weak keys are made of, so that a
+//! mutated key lands on or one bit off a weak one more often than chance
+//! would put it there.
 //!
 //! # The watchdog
 //!
-//! Nothing here should be able to loop -- every parser walks a bounded input
-//! once, and the two that recurse have a depth limit -- but "should" is what a
-//! fuzzer is for. A thread watches the clock, and an iteration that outlasts
-//! `--timeout` seconds is reported as a hang with the input that caused it.
-//! There is no way to unwind out of it, so that ends the run.
+//! Nothing here can loop -- a mode walks its input once and a block takes
+//! sixteen rounds -- but "cannot" is what a fuzzer is for. A thread watches
+//! the clock, and an iteration that outlasts `--timeout` seconds is reported
+//! as a hang with the input that caused it. There is no way to unwind out of
+//! it, so that ends the run.
 
 const std = @import("std");
 const targets = @import("fuzz_targets");
@@ -81,11 +76,27 @@ fn nowMs(io: std.Io) i64 {
 const Watch = struct {
     /// When the running iteration started, or zero between iterations.
     started_ms: std.atomic.Value(i64) = .init(0),
-    /// The input it is running, which is what a hang has to report.
-    input: []const u8 = &.{},
+    /// A copy of the input it is running, which is what a hang has to
+    /// report. A copy rather than a slice of the loop's buffer, so that the
+    /// watchdog never reads memory the main thread may be reallocating: the
+    /// two can still race over these bytes if an iteration ends in the same
+    /// instant it is declared hung, and then the report is garbled rather
+    /// than the read being of freed memory.
+    input_buffer: [4096]u8 = undefined,
+    input_len: usize = 0,
     target: []const u8 = "",
     timeout_s: u32 = 10,
     dir: []const u8 = "",
+
+    fn setInput(w: *Watch, bytes: []const u8) void {
+        const n = @min(bytes.len, w.input_buffer.len);
+        @memcpy(w.input_buffer[0..n], bytes[0..n]);
+        w.input_len = n;
+    }
+
+    fn input(w: *const Watch) []const u8 {
+        return w.input_buffer[0..w.input_len];
+    }
 };
 
 var watch: Watch = .{};
@@ -158,7 +169,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("no target called {s}; there are: {s}\n", .{ name, targetNames() });
             std.process.exit(2);
         };
-        watch.input = bytes;
+        watch.setInput(bytes);
         watch.target = target.name;
         watch.started_ms.store(nowMs(io), .release);
         target.run(bytes) catch |err| {
@@ -184,7 +195,7 @@ pub fn main(init: std.process.Init) !void {
         const deadline = nowMs(io) + @as(i64, seconds) * 1000;
         while (if (iterations) |n| runs < n else nowMs(io) < deadline) : (runs += 1) {
             try makeInput(gpa, &buffer, random, target);
-            watch.input = buffer.items;
+            watch.setInput(buffer.items);
             watch.target = target.name;
             watch.started_ms.store(nowMs(io), .release);
             const result = target.run(buffer.items);
@@ -224,12 +235,7 @@ fn targetNames() []const u8 {
     return names;
 }
 
-/// Make the next input: two length-prefixed chunks and a random tail.
-///
-/// Two, because a target may ask for two slices -- `paths` wants a working
-/// directory and then an argument -- and the second would otherwise only ever
-/// see whatever random bytes happened to follow. A target that asks for one
-/// slice reads the first chunk and leaves the rest for its `value` calls.
+/// Make the next input: one length-prefixed chunk and a random tail.
 ///
 /// The length is capped at `target.content_max` rather than at some number
 /// chosen here, because `Smith.slice` answers a length larger than its buffer
@@ -246,40 +252,34 @@ fn makeInput(
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(gpa);
 
-    for (0..2) |_| {
-        content.clearRetainingCapacity();
-        if (target.corpus.len == 0 or random.uintLessThan(u8, 8) == 0) {
-            // Sometimes nothing but noise, so that the shapes nobody thought
-            // of are reachable at all.
-            const len = random.uintLessThan(usize, target.content_max);
-            try content.ensureUnusedCapacity(gpa, len);
-            for (0..len) |_| content.appendAssumeCapacity(random.int(u8));
-        } else {
-            const seed = target.corpus[random.uintLessThan(usize, target.corpus.len)];
-            try content.appendSlice(gpa, seed);
-            // Splicing, which is what the stream-shaped targets want: two of
-            // them read a series of messages rather than one, and a second
-            // seed stuck on the end -- often cut short, so that the join
-            // lands in the middle of a message -- is how the boundary between
-            // one message and the next gets tested at all. A single mutated
-            // seed never produces a truncated message followed by a good one.
-            if (random.uintLessThan(u8, 4) == 0) {
-                const other = target.corpus[random.uintLessThan(usize, target.corpus.len)];
-                const take = if (other.len == 0) 0 else random.uintLessThan(usize, other.len) + 1;
-                try content.appendSlice(gpa, other[0..take]);
-            }
-            const rounds = 1 + random.uintLessThan(usize, 8);
-            for (0..rounds) |_| try mutate(gpa, &content, random, interestingFor(target));
+    if (target.corpus.len == 0 or random.uintLessThan(u8, 8) == 0) {
+        // Sometimes nothing but noise, so that the shapes nobody thought of
+        // are reachable at all.
+        const len = random.uintLessThan(usize, target.content_max);
+        try content.ensureUnusedCapacity(gpa, len);
+        for (0..len) |_| content.appendAssumeCapacity(random.int(u8));
+    } else {
+        const seed = target.corpus[random.uintLessThan(usize, target.corpus.len)];
+        try content.appendSlice(gpa, seed);
+        // Splicing: a second seed stuck on the end, often cut short, is how
+        // a key from one seed meets a plaintext length from another, which a
+        // single mutated seed rarely produces.
+        if (random.uintLessThan(u8, 4) == 0) {
+            const other = target.corpus[random.uintLessThan(usize, target.corpus.len)];
+            const take = if (other.len == 0) 0 else random.uintLessThan(usize, other.len) + 1;
+            try content.appendSlice(gpa, other[0..take]);
         }
-        if (content.items.len > target.content_max) {
-            content.shrinkRetainingCapacity(target.content_max);
-        }
-
-        var length: [4]u8 = undefined;
-        std.mem.writeInt(u32, &length, @intCast(content.items.len), .little);
-        try out.appendSlice(gpa, &length);
-        try out.appendSlice(gpa, content.items);
+        const rounds = 1 + random.uintLessThan(usize, 8);
+        for (0..rounds) |_| try mutate(gpa, &content, random);
     }
+    if (content.items.len > target.content_max) {
+        content.shrinkRetainingCapacity(target.content_max);
+    }
+
+    var length: [4]u8 = undefined;
+    std.mem.writeInt(u32, &length, @intCast(content.items.len), .little);
+    try out.appendSlice(gpa, &length);
+    try out.appendSlice(gpa, content.items);
 
     // And a tail, for whatever a target asks after its slices: an `i64` reads
     // eight bytes from here.
@@ -288,7 +288,7 @@ fn makeInput(
     for (0..tail) |_| out.appendAssumeCapacity(random.int(u8));
 }
 
-fn mutate(gpa: std.mem.Allocator, content: *std.ArrayList(u8), random: std.Random, interesting: []const u8) !void {
+fn mutate(gpa: std.mem.Allocator, content: *std.ArrayList(u8), random: std.Random) !void {
     if (content.items.len == 0) {
         try content.append(gpa, random.int(u8));
         return;
@@ -297,7 +297,8 @@ fn mutate(gpa: std.mem.Allocator, content: *std.ArrayList(u8), random: std.Rando
         // A byte, replaced. The commonest useful mutation, and the one that
         // turns a length into a nearly-right length.
         0, 1 => content.items[random.uintLessThan(usize, content.items.len)] = random.int(u8),
-        // A byte, replaced by one of the ones this protocol is made of.
+        // A byte, replaced by one of the ones a cipher is most likely to
+        // mishandle.
         2, 3 => content.items[random.uintLessThan(usize, content.items.len)] =
             interesting[random.uintLessThan(usize, interesting.len)],
         4 => try content.insert(gpa, random.uintLessThan(usize, content.items.len), random.int(u8)),
@@ -314,47 +315,18 @@ fn mutate(gpa: std.mem.Allocator, content: *std.ArrayList(u8), random: std.Rando
     }
 }
 
-/// The bytes each kind of input is mostly made of.
+/// The bytes an input is nudged towards.
 ///
-/// For text, the alphabet a dotted-decimal OID is written in, and the
-/// punctuation most likely to be mistaken for part of one.
-const interesting_text = blk: {
-    var set: []const u8 = "0123456789";
-    set = set ++ "..........";
-    set = set ++ " -+,;:/\\";
-    set = set ++ &[_]u8{ 0x00, 0x7f, 0x80, 0xff };
-    break :blk set;
+/// All zeros and all ones, which are real keys and real blocks; the bytes the
+/// four weak keys are made of, so that a mutated key lands on or beside one;
+/// and a byte with only its parity bit set, which the cipher must ignore.
+const interesting = [_]u8{
+    0x00, 0xff,
+    0x01, 0xfe,
+    0xe0, 0xf1,
+    0x1f, 0x0e,
+    0x80, 0x7f,
 };
-
-/// And for BER: the identifier octets these encodings are built from, the
-/// lengths that start the long form, and the boundaries a length check is most
-/// likely to have got wrong.
-const interesting_binary = blk: {
-    // SEQUENCE, SET, INTEGER, OCTET STRING, BOOLEAN, ENUMERATED, NULL,
-    // OBJECT IDENTIFIER, BIT STRING.
-    var set: []const u8 = &[_]u8{ 0x30, 0x31, 0x02, 0x04, 0x01, 0x0a, 0x05, 0x06, 0x03 };
-    // The high tag number form, and the application and context classes that
-    // carry a protocol's own types -- SNMP's Counter32 through Counter64 and
-    // its three exception markers, and the PDU tags above them.
-    set = set ++ &[_]u8{ 0x1f, 0x3f, 0x5f, 0x7f, 0x9f, 0xbf, 0xdf, 0xff };
-    set = set ++ &[_]u8{ 0x40, 0x41, 0x42, 0x43, 0x44, 0x46, 0x80, 0x81, 0x82 };
-    set = set ++ &[_]u8{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
-    // The base-128 continuation bit, which is what a sub-identifier and a
-    // high tag number are made of, and the non-minimal leading value both
-    // must reject.
-    set = set ++ &[_]u8{ 0x80, 0x81, 0x8f, 0x90, 0x2b, 0x28, 0x50, 0x4f };
-    // Lengths: nothing, one, the short form's last value, the long form's
-    // first, and the ones that claim more than anybody has.
-    set = set ++ &[_]u8{ 0x00, 0x01, 0x7f, 0x81, 0x82, 0x84, 0x88, 0xff };
-    break :blk set;
-};
-
-fn interestingFor(target: targets.Target) []const u8 {
-    return switch (target.flavor) {
-        .text => interesting_text,
-        .binary => interesting_binary,
-    };
-}
 
 /// Print a failing input and write it where it can be fed back.
 fn report(io: std.Io, dir: []const u8, target: []const u8, input: []const u8) !void {
@@ -416,17 +388,17 @@ fn watchdog(io: std.Io) void {
             "\n{s}: no answer after {d} seconds, which is a hang\n",
             .{ watch.target, @divTrunc(elapsed, 1000) },
         );
-        show(watch.input);
+        show(watch.input());
         var name: [128]u8 = undefined;
         const path = std.fmt.bufPrint(&name, "{s}/{s}-hang-{x:0>16}.bin", .{
             watch.dir,
             watch.target,
-            std.hash.Wyhash.hash(0, watch.input),
+            std.hash.Wyhash.hash(0, watch.input()),
         }) catch std.process.exit(3);
         std.Io.Dir.cwd().createDirPath(io, watch.dir) catch {};
         if (std.Io.Dir.cwd().createFile(io, path, .{})) |file| {
             defer file.close(io);
-            file.writeStreamingAll(io, watch.input) catch {};
+            file.writeStreamingAll(io, watch.input()) catch {};
             std.debug.print("written to {s}\n", .{path});
         } else |_| {}
         std.process.exit(3);

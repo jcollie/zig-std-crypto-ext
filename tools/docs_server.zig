@@ -13,10 +13,6 @@
 //! it is a convenience for reading `zig build docs`, not a web server, and
 //! nothing about it should be pointed at a network.
 //!
-//! It is worth noting what this is *not*: this repository implements a file
-//! transfer protocol, and none of that is used here. HTTP is what a browser
-//! speaks, so HTTP is what this speaks.
-//!
 //! Every connection gets its own thread, which is not a throughput concern but
 //! a correctness one: a browser opens several connections at once and holds
 //! some of them open without sending anything, so a server that reads them one

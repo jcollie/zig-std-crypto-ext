@@ -51,7 +51,8 @@ fn cbcProperty(input: []const u8) !void {
     const body = input[Des.key_length + Des.block_length ..];
 
     // CBC cannot encrypt a partial block, so round down. A caller who passes
-    // one gets an assertion, which is the documented contract.
+    // one trips an assertion in a safe build and undefined behaviour in a
+    // fast one, which is why the contract is theirs to check first.
     const len = body.len - body.len % Des.block_length;
     if (len == 0) return;
     const plaintext = body[0..len];
@@ -60,8 +61,6 @@ fn cbcProperty(input: []const u8) !void {
     if (len > buffer.len) return;
 
     modes.cbcEncrypt(Des.EncryptCtx, Des.initEnc(key), buffer[0..len], plaintext, iv);
-    // A different IV must give a different first block, unless the plaintext
-    // conspires -- so this only checks the cipher is doing something at all.
     var back: [4096]u8 = undefined;
     modes.cbcDecrypt(Des.DecryptCtx, Des.initDec(key), back[0..len], buffer[0..len], iv);
     try testing.expectEqualSlices(u8, plaintext, back[0..len]);
@@ -254,9 +253,6 @@ pub const Target = struct {
     /// buffer rather than a truncated one, so a generator that does not know
     /// this number hands the target nothing at all most of the time.
     content_max: usize,
-    flavor: Flavor = .binary,
-
-    pub const Flavor = enum { text, binary };
 };
 
 fn Driven(comptime one: fn (void, *Smith) anyerror!void) type {

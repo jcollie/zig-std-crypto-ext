@@ -7,14 +7,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // One module, and no dependencies at all: the encoding rules need nothing
-    // but `std`, and keeping it that way is most of the point of pulling this
-    // out of a protocol library. Anything that has to know what a value
-    // *means* -- an IP address, a MAC address, a MIB -- belongs to the
-    // protocol above, not here.
+    // One module, and no dependencies at all: a block cipher and its modes
+    // need nothing but `std`, and keeping it that way is most of the point of
+    // pulling this out of a protocol library. Anything that knows where a key
+    // *came from* -- a password localised to an engine ID, a session key --
+    // belongs to the protocol above, not here.
     const mod = b.addModule("des", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        // Without this the module is Debug whatever -Doptimize says, and the
+        // tests would never see the cipher as a release build compiles it --
+        // which is the build in which its constant-time claim has to hold.
+        .optimize = optimize,
     });
 
     // A test executable covers one module, so each needs its own. Missing one
@@ -22,7 +26,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
 
-    // The fuzz targets: what the decoder must do with input nobody wrote.
+    // The fuzz targets: what the ciphers and modes must do with keys and data
+    // nobody chose.
     // They are ordinary tests as well as fuzz tests, so `zig build test`
     // exercises the same properties on the seeds checked in beside them.
     const fuzz_mod = b.createModule(.{
@@ -33,7 +38,7 @@ pub fn build(b: *std.Build) void {
     });
     // Zig's fuzzer takes one test at a time and keeps a coverage file per
     // test, so naming a target is what you want when a finding is being
-    // chased: `zig build fuzz --fuzz -Dfuzz-filter=oid`.
+    // chased: `zig build fuzz --fuzz -Dfuzz-filter=cfb`.
     const fuzz_filter = b.option(
         []const u8,
         "fuzz-filter",

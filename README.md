@@ -50,6 +50,31 @@ library has to supply a cipher `std` omits and a mode `std` omits, for two
 different ciphers — which is why `modes` is generic over the cipher rather than
 tied to DES.
 
+## What it does promise
+
+Obsolete is not the same as careless, and two things are deliberately true of
+this code.
+
+**The cipher is constant-time in the key and the data.** The tables are only
+ever read at constant indices, every loop runs a fixed number of times, and
+the S-boxes — the one place a DES implementation normally reads memory at a
+key-dependent address, which is the cache-timing attack of Tsunoo et al. — are
+evaluated with masks and a shift rather than a lookup. The key helpers are
+written the same way, since the key is what they are given. That rests on
+integer compare, mask and variable shift being constant-time, which they are
+on x86-64 and AArch64, and on the compiler not turning a mask back into a
+branch, which nothing forbids, so like every such claim made in a language
+without constant-time semantics it is best-effort. It is not bitsliced.
+
+**The modes' length checks are assertions.** `dst.len >= src.len`, and a whole
+number of blocks for CBC and ECB, are checked in a Debug or ReleaseSafe build
+and not at all in ReleaseFast or ReleaseSmall, where a violation reads past
+`src` and writes past `dst`. A ciphertext length that came off the wire is
+checked by the caller before it gets here, which is how `std.crypto`'s own
+modes behave too. The doc comment on `modes` spells out the rest: `dst` is the
+same slice as `src` or does not overlap it, and the mode's temporaries are
+zeroed on return while the contexts, being the caller's, are not.
+
 ## What is here
 
 | | |
