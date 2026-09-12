@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 {
-  description = "zig-des";
+  description = "zig-std-crypto-ext";
 
   inputs = {
     nixpkgs = {
@@ -87,8 +87,8 @@
           pkgs = makePackages system;
         in
         rec {
-          zig-des = pkgs.callPackage ./package.nix { };
-          default = zig-des;
+          zig-std-crypto-ext = pkgs.callPackage ./package.nix { };
+          default = zig-std-crypto-ext;
         }
       );
 
@@ -102,7 +102,7 @@
           pkgs = makePackages system;
         in
         {
-          zig-des = pkgs.callPackage ./package.nix { };
+          zig-std-crypto-ext = pkgs.callPackage ./package.nix { };
         }
       );
 
@@ -113,7 +113,7 @@
         in
         {
           default = pkgs.mkShell {
-            name = "zig-des";
+            name = "zig-std-crypto-ext";
             nativeBuildInputs = [
               (fuzzableZig pkgs)
               pkgs.git-pages-cli

@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     // pulling this out of a protocol library. Anything that knows where a key
     // *came from* -- a password localised to an engine ID, a session key --
     // belongs to the protocol above, not here.
-    const mod = b.addModule("des", .{
+    const mod = b.addModule("std_crypto_ext", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         // Without this the module is Debug whatever -Doptimize says, and the
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/fuzz.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "des", .module = mod }},
+        .imports = &.{.{ .name = "std_crypto_ext", .module = mod }},
     });
     // Zig's fuzzer takes one test at a time and keeps a coverage file per
     // test, so naming a target is what you want when a finding is being
@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
     // because a fuzzer's whole job is how many inputs it gets through, and
     // ReleaseSafe keeps every check that makes a failure a failure.
     const fuzz_run = b.addExecutable(.{
-        .name = "zig-des-fuzz",
+        .name = "zig-std-crypto-ext-fuzz",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/fuzz.zig"),
             .target = b.graph.host,
@@ -96,7 +96,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     const timing = b.addExecutable(.{
-        .name = "zig-des-timing",
+        .name = "zig-std-crypto-ext-timing",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/timing.zig"),
             .target = b.graph.host,
@@ -122,7 +122,7 @@ pub fn build(b: *std.Build) void {
     // module is built as a library purely to get at it. What comes out is not
     // a page but a program: a WebAssembly viewer, its javascript, and a tar of
     // the sources it reads from.
-    const library = b.addLibrary(.{ .name = "des", .root_module = mod });
+    const library = b.addLibrary(.{ .name = "std_crypto_ext", .root_module = mod });
     const install_docs = b.addInstallDirectory(.{
         .source_dir = library.getEmittedDocs(),
         .install_dir = .prefix,

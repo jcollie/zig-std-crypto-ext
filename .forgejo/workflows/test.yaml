@@ -47,7 +47,7 @@ jobs:
 
       - name: Publish docs
         run: >
-          nix develop -c git-pages-cli https://jeff.jcollie.page/zig-des/
+          nix develop -c git-pages-cli https://jeff.jcollie.page/zig-std-crypto-ext/
           --server jcollie.page
           --token ${{ forge.token }}
           --upload-dir zig-out/docs

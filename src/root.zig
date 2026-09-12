@@ -1,19 +1,28 @@
 // SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
 // SPDX-License-Identifier: MIT
 
-//! DES, Triple DES, and the block cipher modes `std.crypto` leaves out.
+//! The ciphers and modes `std.crypto` leaves out.
 //!
-//! `std.crypto` has no DES at all and `std.crypto.modes` has only counter
-//! mode, which is the right call for a standard library aimed at new code.
-//! This is for the other case: a protocol specified decades ago that is still
-//! deployed and still has to be spoken. The motivating one is SNMPv3 privacy,
-//! where RFC 3414's `usmDESPrivProtocol` is DES-CBC and remains the default on
-//! a great deal of network equipment, and RFC 3826's `usmAesCfb128PrivProtocol`
-//! is AES-128 in full-block CFB -- so one library has to supply a cipher `std`
-//! omits and a mode `std` omits, for two different ciphers.
+//! `std.crypto` is aimed at code being written now, and stops in sensible
+//! places: no DES, no Triple DES, no AES-192, and of the block cipher modes
+//! only counter mode. Every one of those omissions is defensible on its own
+//! terms -- nothing new should choose any of them.
+//!
+//! This is the other case: a protocol specified decades ago that is still
+//! deployed and still has to be spoken. The motivating one is SNMPv3 privacy.
+//! RFC 3414's `usmDESPrivProtocol` is DES-CBC and remains the default on a
+//! great deal of network equipment; RFC 3826's `usmAesCfb128PrivProtocol` is
+//! AES-128 in full-block CFB; and `draft-blumenthal-aes-usm`, which Cisco
+//! implements, adds AES-192 and AES-256 in the same mode. So one library has
+//! to supply two ciphers `std` omits and a mode `std` omits, across four key
+//! sizes -- which is why the modes here are generic over the cipher rather
+//! than tied to any of them.
+//!
+//! Named for what it is rather than for its first occupant: it started as
+//! `zig-des` and DES is now the smaller half of it.
 //!
 //! ```zig
-//! const des = @import("des");
+//! const des = @import("std_crypto_ext");
 //!
 //! // DES-CBC, as SNMPv3 privacy uses it.
 //! var ciphertext: [24]u8 = undefined;

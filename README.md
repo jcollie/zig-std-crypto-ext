@@ -3,18 +3,21 @@ SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
 SPDX-License-Identifier: MIT
 -->
 
-# zig-des
+# zig-std-crypto-ext
 
-DES, Triple DES, **AES-192**, and the block cipher modes `std.crypto` leaves
-out — CBC, CFB and ECB, generic over any block cipher.
+The ciphers and modes `std.crypto` leaves out: **DES**, **Triple DES**,
+**AES-192**, and **CBC, CFB and ECB**, generic over any block cipher.
+
+Named for what it is rather than for its first occupant — it started as
+`zig-std-crypto-ext`, and DES is now the smaller half of it.
 
 The API documentation is generated from the doc comments, which carry most of
 the explanation, and is published at
-**<https://jeff.jcollie.page/zig-des/>**.
+**<https://jeff.jcollie.page/zig-std-crypto-ext/>**.
 
 ```console
-$ git clone https://git.jcollie.dev/jeff/zig-des.git
-$ cd zig-des
+$ git clone https://git.jcollie.dev/jeff/zig-std-crypto-ext.git
+$ cd zig-std-crypto-ext
 $ nix develop -c zig build test
 ```
 
@@ -22,10 +25,10 @@ $ nix develop -c zig build test
 
 Two homes, with the same history in both.
 
-* Forgejo, at <https://git.jcollie.dev/jeff/zig-des>, which is where the
+* Forgejo, at <https://git.jcollie.dev/jeff/zig-std-crypto-ext>, which is where the
   workflow runs and where the documentation is published from.
 * [Tangled](https://tangled.org/), at
-  <https://tangled.org/jcollie.dev/zig-des>.
+  <https://tangled.org/jcollie.dev/zig-std-crypto-ext>.
 
 ## Why this exists
 
@@ -94,11 +97,11 @@ zeroed on return while the contexts, being the caller's, are not.
 ## Using it
 
 ```console
-$ zig fetch --save git+https://git.jcollie.dev/jeff/zig-des.git
+$ zig fetch --save git+https://git.jcollie.dev/jeff/zig-std-crypto-ext.git
 ```
 
 ```zig
-const des = @import("des");
+const des = @import("std_crypto_ext");
 
 // DES-CBC, as SNMPv3 privacy uses it.
 var ciphertext: [24]u8 = undefined;

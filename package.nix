@@ -8,7 +8,7 @@
 }:
 
 stdenv.mkDerivation {
-  pname = "zig-des";
+  pname = "zig-std-crypto-ext";
   version = "0.0.0";
 
   # Named rather than filtered, so that editing something outside this list --
@@ -65,7 +65,7 @@ stdenv.mkDerivation {
 
   meta = {
     description = "DES, Triple DES, and the block cipher modes std.crypto leaves out";
-    homepage = "https://git.jcollie.dev/jeff/zig-des";
+    homepage = "https://git.jcollie.dev/jeff/zig-std-crypto-ext";
     license = lib.licenses.mit;
     platforms = lib.platforms.all;
   };

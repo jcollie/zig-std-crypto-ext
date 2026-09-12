@@ -1,7 +1,7 @@
 version = 1
-SPDX-PackageName = "zig-des"
+SPDX-PackageName = "zig-std-crypto-ext"
 SPDX-PackageSupplier = "Jeffrey C. Ollie <jeff@ocjtech.us>"
-SPDX-PackageDownloadLocation = "https://git.jcollie.dev/jeff/zig-des"
+SPDX-PackageDownloadLocation = "https://git.jcollie.dev/jeff/zig-std-crypto-ext"
 
 [[annotations]]
 path = ["flake.lock", "build.zig.zon", ".gitignore"]

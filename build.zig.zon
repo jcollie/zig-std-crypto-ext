@@ -1,7 +1,7 @@
 .{
-    .name = .des,
+    .name = .std_crypto_ext,
     .version = "0.0.0",
-    .fingerprint = 0x6119058aabb0876e, // Changing this has security and trust implications.
+    .fingerprint = 0xa03576c1e17069ce, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

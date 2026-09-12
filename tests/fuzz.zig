@@ -24,7 +24,7 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const Smith = std.testing.Smith;
 
-const des = @import("des");
+const des = @import("std_crypto_ext");
 const Des = des.Des;
 const Des3 = des.Des3;
 const modes = des.modes;
