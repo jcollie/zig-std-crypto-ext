@@ -1,0 +1,10 @@
+version = 1
+SPDX-PackageName = "zig-des"
+SPDX-PackageSupplier = "Jeffrey C. Ollie <jeff@ocjtech.us>"
+SPDX-PackageDownloadLocation = "https://git.jcollie.dev/jeff/zig-des"
+
+[[annotations]]
+path = ["flake.lock", "build.zig.zon", ".gitignore"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 Jeffrey C. Ollie <jeff@ocjtech.us>"
+SPDX-License-Identifier = "MIT"

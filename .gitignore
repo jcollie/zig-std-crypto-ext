@@ -1,0 +1,6 @@
+zig-out/
+zig-pkg/
+.zig-cache/
+fuzz-findings/
+result
+result-*

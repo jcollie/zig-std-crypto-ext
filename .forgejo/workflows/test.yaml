@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+# SPDX-License-Identifier: MIT
+
+name: test
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: nixos-do-s
+    steps:
+      - name: Check out
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check REUSE compliance
+        run: nix develop -c reuse lint
+
+      - name: Check Zig formatting compliance
+        run: nix develop -c zig fmt --check .
+
+      - name: Test
+        run: nix develop -c zig build test --summary all
+
+      - name: Compile everything without running it
+        run: nix develop -c zig build check
+
+      # Bounded by a count rather than a clock, so that the run is the same on
+      # every machine and a slow runner does not mean a shallower test.
+      - name: Fuzz
+        run: nix develop -c zig build fuzz-run -- --iterations 500000
+
+  # Published only from main, so that a branch build cannot replace the site
+  # with a work in progress, and only after `test` has passed, so that it
+  # cannot document a tree that does not compile.
+  docs:
+    needs: test
+    if: ${{ forge.ref == 'refs/heads/main' }}
+    runs-on: nixos-do-s
+    steps:
+      - name: Check out
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build API docs
+        run: nix develop -c zig build docs
+
+      - name: Publish docs
+        run: >
+          nix develop -c git-pages-cli https://jeff.jcollie.page/zig-des/
+          --server jcollie.page
+          --token ${{ forge.token }}
+          --upload-dir zig-out/docs
