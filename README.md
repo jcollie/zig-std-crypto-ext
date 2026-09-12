@@ -20,8 +20,12 @@ $ nix develop -c zig build test
 
 ## Where this lives
 
+Two homes, with the same history in both.
+
 * Forgejo, at <https://git.jcollie.dev/jeff/zig-des>, which is where the
   workflow runs and where the documentation is published from.
+* [Tangled](https://tangled.org/), at
+  <https://tangled.org/jcollie.dev/zig-des>.
 
 ## Why this exists
 
