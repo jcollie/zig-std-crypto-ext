@@ -30,14 +30,14 @@ Two homes, with the same history in both.
 ## Why this exists
 
 ⚠️ **Everything here is obsolete, and that is the point.** Single DES has a
-56-bit key and has been brute-forceable since 1998. Two-key Triple DES has a
-meet-in-the-middle attack, and the 64-bit block gives a birthday bound around
-32 GiB under one key however long the key is. CBC and CFB authenticate nothing
-and CBC has a long history of padding oracles. **Nothing new should choose any
-of it.**
+56-bit key and has been brute-forceable since 1998 [8]. Two-key Triple DES has
+a meet-in-the-middle attack [9], and the 64-bit block gives a birthday bound
+around 32 GiB under one key however long the key is [10]. CBC and CFB
+authenticate nothing and CBC has a long history of padding oracles. **Nothing
+new should choose any of it.**
 
 What keeps it alive is equipment that already exists. SNMPv3's
-`usmDESPrivProtocol` (RFC 3414) is DES-CBC and is still the default privacy
+`usmDESPrivProtocol` (RFC 3414 [6]) is DES-CBC and is still the default privacy
 protocol on a great deal of network hardware, so a manager that cannot speak it
 cannot talk to those devices at all. Kerberos 4, PKCS#12, MS-CHAP and a good
 deal of banking hardware are in the same position. `std.crypto` quite reasonably
@@ -45,7 +45,7 @@ declines to ship any of this; this library is where it goes instead, clearly
 labelled.
 
 The modes are here for a second reason: `std.crypto.modes` has only counter
-mode, and RFC 3826 specifies **AES**-128 in full-block CFB for SNMPv3. So one
+mode, and RFC 3826 [7] specifies **AES**-128 in full-block CFB for SNMPv3. So one
 library has to supply a cipher `std` omits and a mode `std` omits, for two
 different ciphers — which is why `modes` is generic over the cipher rather than
 tied to DES.
@@ -58,7 +58,7 @@ this code.
 **The cipher is constant-time in the key and the data.** The tables are only
 ever read at constant indices, every loop runs a fixed number of times, and
 the S-boxes — the one place a DES implementation normally reads memory at a
-key-dependent address, which is the cache-timing attack of Tsunoo et al. — are
+key-dependent address, which is the cache-timing attack of Tsunoo et al. [11] — are
 evaluated with masks and a shift rather than a lookup. The key helpers are
 written the same way, since the key is what they are given. That rests on
 integer compare, mask and variable shift being constant-time, which they are
@@ -66,7 +66,7 @@ on x86-64 and AArch64, and on the compiler not turning a mask back into a
 branch, which nothing forbids, so like every such claim made in a language
 without constant-time semantics it is best-effort. It is not bitsliced.
 Because it is best-effort it is also measured: `zig build timing` runs the
-test from dudect against the release build on the machine at hand, and the
+test from dudect [12] against the release build on the machine at hand, and the
 section on tests below says how to read it.
 
 **The modes' length checks are assertions.** `dst.len >= src.len`, and a whole
@@ -130,7 +130,7 @@ $ nix develop -c zig build fuzz-run -- --seconds 60
 $ nix develop -c zig build timing
 ```
 
-**Every vector was cross-checked against OpenSSL's legacy provider**, not
+**Every vector was cross-checked against OpenSSL's legacy provider** [13], not
 transcribed and trusted:
 
 ```console
@@ -141,9 +141,14 @@ That is not belt-and-braces. A DES that is self-consistent and *wrong* is easy
 to write — index the S-boxes with the raw six input bits rather than the
 published row and column and it still round-trips perfectly — and that is
 precisely the bug that occurred here. A round-trip test proves almost nothing,
-so the known-answer tests are the real ones: FIPS 46-3, Rivest's cycle, the NBS
-samples, and NIST SP 800-38A F.3.13 for AES-128-CFB. One of the four NBS values
-was wrong when first written, and OpenSSL is what settled which of us was.
+so the known-answer tests are the real ones: FIPS 46-3 [1], the NBS samples
+[2], Rivest's sixteen-step cycle [3], NIST SP 800-67's Appendix B for Triple
+DES [4], and NIST SP 800-38A F.3.13 for AES-128-CFB [5], with the DES-CFB and
+two-key Triple DES answers taken from OpenSSL. One of the four NBS values was
+wrong when first written, and OpenSSL is what settled which of us was. Rivest's
+cycle is the one that earns its place: sixteen encryptions and decryptions
+chained through each other, which he showed detects every single-fault error
+in an implementation with one comparison at the end.
 
 The fuzz targets are round-trip properties over the *modes*, where there is
 real room to be wrong — an off-by-one on a final partial block, a chaining
@@ -154,7 +159,7 @@ three equal keys make 3DES into DES, and that a weak key is an involution, for
 every key and block rather than for one.
 
 `zig build timing` measures the constant-time claim instead of trusting it.
-It is the test from dudect: each of the cipher and the key helpers is timed on
+It is the test from dudect [12]: each of the cipher and the key helpers is timed on
 a fixed input and on random ones, hundreds of thousands of times in a random
 order, and Welch's t-test asks whether the two timing distributions can be
 told apart. A |t| above 10 is a leak, and at these sample counts that is a
@@ -172,6 +177,62 @@ reports every function within 2.
 $ nix develop -c zig build docs         # into zig-out/docs
 $ nix develop -c zig build docs-serve   # http://127.0.0.1:8000
 ```
+
+## References cited
+
+1. National Institute of Standards and Technology, *Data Encryption Standard
+   (DES)*, FIPS PUB 46-3, 25 October 1999; withdrawn 19 May 2005.
+   <https://csrc.nist.gov/pubs/fips/46-3/final>. The tables, and the first
+   known answer.
+2. Jason Gait, *Validating the Correctness of Hardware Implementations of the
+   NBS Data Encryption Standard*, NBS Special Publication 500-20, National
+   Bureau of Standards, 1977, revised 1980.
+   <https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nbsspecialpublication500-20e1980.pdf>.
+   The NBS sample vectors.
+3. Ronald L. Rivest, *Testing Implementations of DES*, 23 February 1985.
+   <https://people.csail.mit.edu/rivest/pubs/Riv85.txt>. The sixteen-step
+   cycle from `9474B8E8C73BCA7D` to `1B1A2DDB4C642438`.
+4. Elaine Barker and Nicky Mouha, *Recommendation for the Triple Data
+   Encryption Algorithm (TDEA) Block Cipher*, NIST Special Publication 800-67
+   Revision 2, November 2017. <https://doi.org/10.6028/NIST.SP.800-67r2>.
+   Appendix B, the Triple DES known answer.
+5. Morris Dworkin, *Recommendation for Block Cipher Modes of Operation:
+   Methods and Techniques*, NIST Special Publication 800-38A, December 2001.
+   <https://doi.org/10.6028/NIST.SP.800-38A>. CBC, CFB and ECB as specified,
+   and the AES-128-CFB128 vector in F.3.13.
+6. Uri Blumenthal and Bert Wijnen, *User-based Security Model (USM) for
+   version 3 of the Simple Network Management Protocol (SNMPv3)*, RFC 3414,
+   December 2002. <https://www.rfc-editor.org/rfc/rfc3414>.
+7. Uri Blumenthal, Fabio Maino and Keith McCloghrie, *The Advanced Encryption
+   Standard (AES) Cipher Algorithm in the SNMP User-based Security Model*,
+   RFC 3826, June 2004. <https://www.rfc-editor.org/rfc/rfc3826>.
+8. Electronic Frontier Foundation, *Cracking DES: Secrets of Encryption
+   Research, Wiretap Politics & Chip Design*, O'Reilly, May 1998,
+   ISBN 1-56592-520-3. The machine that made 56 bits a matter of days.
+9. Paul C. van Oorschot and Michael J. Wiener, "A Known-Plaintext Attack on
+   Two-Key Triple Encryption", *Advances in Cryptology — EUROCRYPT '90*,
+   Lecture Notes in Computer Science 473, pp. 318–325, 1991.
+   <https://doi.org/10.1007/3-540-46877-3_29>.
+10. Karthikeyan Bhargavan and Gaëtan Leurent, "On the Practical (In-)Security
+    of 64-bit Block Ciphers", *Proceedings of the 2016 ACM SIGSAC Conference
+    on Computer and Communications Security*, pp. 456–467, October 2016.
+    <https://doi.org/10.1145/2976749.2978423>. The birthday bound, known as
+    Sweet32.
+11. Yukiyasu Tsunoo, Teruo Saito, Tomoyasu Suzaki, Maki Shigeri and Hiroshi
+    Miyauchi, "Cryptanalysis of DES Implemented on Computers with Cache",
+    *Cryptographic Hardware and Embedded Systems — CHES 2003*, Lecture Notes
+    in Computer Science 2779, pp. 62–76, 2003.
+    <https://doi.org/10.1007/978-3-540-45238-6_6>. Key recovery from the
+    S-box lookups' cache behaviour, which is what the constant-time S-boxes
+    are for.
+12. Oscar Reparaz, Josep Balasch and Ingrid Verbauwhede, "Dude, is my code
+    constant time?", *Design, Automation & Test in Europe (DATE) 2017*; IACR
+    Cryptology ePrint Archive, Report 2016/1123.
+    <https://eprint.iacr.org/2016/1123>. The test that `zig build timing`
+    runs.
+13. The OpenSSL Project, *OpenSSL* 3.6.3, `openssl enc` with the legacy
+    provider. <https://www.openssl.org/>. The independent implementation
+    every vector was checked against.
 
 ## Licence
 

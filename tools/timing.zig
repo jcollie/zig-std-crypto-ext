@@ -14,7 +14,7 @@
 //! $ zig build timing -- --samples 1000000 --seed 7
 //! ```
 //!
-//! It is the test from dudect (Reparaz, Balasch and Verbauwhede, 2016). Each
+//! It is the test from dudect (Reparaz, Balasch and Verbauwhede, 2017). Each
 //! function is timed on two classes of input, one fixed and one random, many
 //! times in a random order, and Welch's t-test asks whether the two timing
 //! distributions have the same mean. The tail of a timing distribution is

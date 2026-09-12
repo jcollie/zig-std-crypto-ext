@@ -613,11 +613,29 @@ test "the FIPS 46-3 known answer" {
     try expectBlock(Des, &.{ 0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1 }, 0x0123456789abcdef, 0x85e813540f0ab405);
 }
 
-test "Ron Rivest's cycle, first step" {
-    // From "Testing Implementations of DES": the all-zero key on the all-zero
-    // block, and the all-ones key on the all-ones block.
+test "the all-zero and all-ones keys and blocks" {
+    // Two of the oldest vectors in circulation, checked against OpenSSL like
+    // the rest. An earlier draft attributed them to Rivest's paper, which
+    // they are not from; his test is the next one.
     try expectBlock(Des, &([_]u8{0x00} ** 8), 0x0000000000000000, 0x8ca64de9c1b123a7);
     try expectBlock(Des, &([_]u8{0xff} ** 8), 0xffffffffffffffff, 0x7359b2163e4edc58);
+}
+
+test "Rivest's cycle" {
+    // "Testing Implementations of DES" (1985): sixteen steps in which each
+    // value is both the key and the block of the next, encrypting on the
+    // even steps and decrypting on the odd. One comparison at the end
+    // detects every one of the 36,568 single-fault errors the paper models,
+    // which is more than any list of vectors does. Reproduced with OpenSSL
+    // before being written here.
+    var x: [8]u8 = undefined;
+    std.mem.writeInt(u64, &x, 0x9474b8e8c73bca7d, .big);
+    for (0..16) |i| {
+        var next: [8]u8 = undefined;
+        if (i % 2 == 0) Des.initEnc(x).encrypt(&next, &x) else Des.initDec(x).decrypt(&next, &x);
+        x = next;
+    }
+    try testing.expectEqual(@as(u64, 0x1b1a2ddb4c642438), std.mem.readInt(u64, &x, .big));
 }
 
 test "the NBS sample round trip" {
