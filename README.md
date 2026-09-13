@@ -24,10 +24,11 @@ $ nix develop -c zig build test
 
 ## Where this lives
 
-Three homes, with the same history in each.
+Four homes, with the same history in each.
 
 * Forgejo, at <https://git.jcollie.dev/jeff/zig-std-crypto-ext>, which is where the
   workflow runs and where the documentation is published from.
+* GitHub, at <https://github.com/jcollie/zig-std-crypto-ext>.
 * [Tangled](https://tangled.org/), at
   <https://tangled.org/jcollie.dev/zig-std-crypto-ext>.
 * [Radicle](https://radicle.xyz/), as `rad:z2UqY7wXCc4xUHRfeaDepK33Kch1Z`. A
