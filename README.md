@@ -5,11 +5,12 @@ SPDX-License-Identifier: MIT
 
 # zig-std-crypto-ext
 
-The ciphers and modes `std.crypto` leaves out: **DES**, **Triple DES**,
-**AES-192**, and **CBC, CFB and ECB**, generic over any block cipher.
+The ciphers, modes and signatures `std.crypto` leaves out: **DES**, **Triple
+DES**, **AES-192**, **CBC, CFB and ECB** generic over any block cipher, and
+**RSA signing**.
 
 Named for what it is rather than for its first occupant — it started as
-`zig-std-crypto-ext`, and DES is now the smaller half of it.
+`zig-des`, and DES is now the smaller half of it.
 
 The API documentation is generated from the doc comments, which carry most of
 the explanation, and is published at
@@ -53,6 +54,16 @@ library has to supply a cipher `std` omits and a mode `std` omits, for two
 different ciphers — which is why `modes` is generic over the cipher rather than
 tied to DES.
 
+**RSA is here for a different reason, and it is not obsolete.** Zig 0.16 does
+ship RSA, but only half of it and only as an implementation detail of
+something else: `std.crypto.Certificate.rsa` has a public key and a verifier
+because checking a certificate chain needs them. There is no private key type
+anywhere in the standard library and nothing that can produce a signature. A
+protocol that has to *sign* — DKIM, JWS `RS256`, a certificate request — has
+nowhere to go. So this library supplies the missing half, and the PKCS#1 and
+PKCS#8 key parsing that has to come with it, since a private key arrives as
+DER inside PEM and `std` will not decode that either.
+
 ## What it does promise
 
 Obsolete is not the same as careless, and two things are deliberately true of
@@ -81,6 +92,19 @@ modes behave too. The doc comment on `modes` spells out the rest: `dst` is the
 same slice as `src` or does not overlap it, and the mode's temporaries are
 zeroed on return while the contexts, being the caller's, are not.
 
+**RSA's private exponentiation is constant-time, and it is neither blinded nor
+CRT.** The exponentiation goes through `std.crypto.ff`, the same Montgomery
+arithmetic `std` verifies certificates with, which is constant time in both
+the base and the exponent — the defence that matters against a remote timing
+attack. It does not blind the input, because blinding needs a modular inverse
+and `std.crypto.ff` exposes none; and it does not use the Chinese Remainder
+Theorem even when the key carries the parameters, which is what makes it an
+order of magnitude slower than OpenSSL (13 ms for a 2048-bit signature
+against roughly 1 ms) and also what means there is no faulty recombination to
+leak the key through. It is appropriate for signing with a key on a machine
+you trust, and it is not a replacement for an HSM. The doc comment on `rsa`
+gives the numbers and the reasoning.
+
 ## What is here
 
 | | |
@@ -93,6 +117,9 @@ zeroed on return while the contexts, being the caller's, are not.
 | `Aes192` | AES-192, the key size `std.crypto` omits — it ships `Aes128` and `Aes256` and nothing between. **Encryption only**, because CFB and CTR never run a cipher backwards; `initDec` is deliberately absent, so asking for it is a compile error rather than a surprise. |
 | `weak_keys`, `isWeak` | The four keys for which DES is an involution. A password-derived key can be one by accident, and `usmDESPrivProtocol` derives its key from a password. |
 | `hasOddParity`, `setOddParity` | The parity convention DES keys are distributed under. The cipher ignores the parity bits entirely — that is what "56-bit key" means. |
+| `rsa.SecretKey` | An RSA private key, read from PKCS#1 or PKCS#8 DER or from the PEM around either — `fromPem` tells the two apart by looking. Held by value, so the DER it came from can be wiped. |
+| `rsa.PublicKey` | An RSA public key, from a `SubjectPublicKeyInfo` or a bare PKCS#1 `RSAPublicKey`, DER or PEM. Both shapes are accepted because formats that carry one are inconsistent about which they mean. |
+| `rsa.pkcs1v1_5.Signer(Hash)` | RFC 8017 RSASSA-PKCS1-v1_5, over SHA-1, SHA-224, SHA-256, SHA-384 or SHA-512. `sign`/`verify` over a message, `signConcat`/`verifyConcat` over its pieces, and `signDigest`/`verifyDigest` for a protocol that hashes something which never exists as contiguous bytes. |
 
 ## Using it
 
@@ -116,6 +143,18 @@ des.modes.cfbEncrypt(
     aes.AesEncryptCtx(aes.Aes128), aes.Aes128.initEnc(aes_key),
     &out, plaintext, aes_iv,
 );
+```
+
+```zig
+const rsa = @import("std_crypto_ext").rsa;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+var der: [rsa.max_secret_key_der]u8 = undefined;
+const sk = try rsa.SecretKey.fromPem(&der, pem_text);
+
+var buf: [rsa.max_modulus_len]u8 = undefined;
+const sig = try rsa.pkcs1v1_5.Signer(Sha256).sign(&buf, message, sk);
+try rsa.pkcs1v1_5.Signer(Sha256).verify(sig, message, sk.publicKey());
 ```
 
 The contexts are shaped like `std.crypto.core.aes`'s so that they read the same
@@ -154,13 +193,31 @@ cycle is the one that earns its place: sixteen encryptions and decryptions
 chained through each other, which he showed detects every single-fault error
 in an implementation with one comparison at the end.
 
+**The RSA vectors were made by OpenSSL too, and for the same reason.** PKCS#1
+v1.5 is deterministic, so "byte for byte identical to what OpenSSL signed" is
+a test that can actually be written — with PSS it could not be — and the suite
+asserts exactly that for 1024- and 2048-bit keys under SHA-1 and SHA-256, in
+both directions: OpenSSL's signatures verify here, and this library's
+signatures are bit-identical to OpenSSL's. Alongside those are the tests that
+a vector cannot reach: that flipping *any single bit* of a signature is
+rejected, which is what catches a comparison that stops early or only compares
+part of the buffer; that truncating the key DER at any offset is an error
+rather than a key missing its tail; and that a key too small, an exponent that
+is even or 1, and a modulus too short for the hash are each refused rather
+than used.
+
 The fuzz targets are round-trip properties over the *modes*, where there is
 real room to be wrong — an off-by-one on a final partial block, a chaining
 value read after being overwritten by an in-place operation, a keystream that
 wrongly depends on how much plaintext follows. They also assert the properties
 no single vector can: that the parity bits never change the ciphertext, that
 three equal keys make 3DES into DES, and that a weak key is an involution, for
-every key and block rather than for one.
+every key and block rather than for one. The key parsers get targets of
+their own, since a DER reader is the one thing here that reads bytes somebody
+else wrote: the property is the weak one — return a key or an error, but stay
+inside the buffer and terminate — seeded with a real key so that mutations
+reach past the first tag. The verifier gets the strong one: every input is a
+forgery, and every one has to be refused.
 
 `zig build timing` measures the constant-time claim instead of trusting it.
 It is the test from dudect [12]: each of the cipher and the key helpers is timed on

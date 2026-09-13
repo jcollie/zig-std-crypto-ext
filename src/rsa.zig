@@ -1,0 +1,1165 @@
+// SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+// SPDX-License-Identifier: MIT
+
+//! RSA signing, which `std.crypto` leaves out.
+//!
+//! Zig 0.16 does ship RSA, but only half of it, and only as an implementation
+//! detail of something else: `std.crypto.Certificate.rsa` has a `PublicKey`, a
+//! PKCS#1 v1.5 verifier and a PSS verifier, because that is what checking a
+//! certificate chain needs. There is no private key type anywhere in the
+//! standard library and nothing that can produce a signature. A protocol that
+//! has to *sign* -- DKIM, JWT, a CSR, anything with an RSA key at the bottom
+//! of it -- has nowhere to go.
+//!
+//! This is that missing half, plus the key parsing that has to come with it,
+//! because a private key arrives as PKCS#1 or PKCS#8 DER inside PEM and none
+//! of those are things `std` will decode for you either.
+//!
+//! ```zig
+//! const rsa = @import("std_crypto_ext").rsa;
+//! const Sha256 = std.crypto.hash.sha2.Sha256;
+//!
+//! var der_buf: [rsa.max_secret_key_der]u8 = undefined;
+//! const sk = try rsa.SecretKey.fromPem(&der_buf, pem_text);
+//!
+//! var sig: [rsa.max_modulus_len]u8 = undefined;
+//! const signature = try rsa.pkcs1v1_5.Signer(Sha256).sign(&sig, message, sk);
+//! ```
+//!
+//! ## What it promises
+//!
+//! The private exponentiation goes through `std.crypto.ff`'s
+//! `powWithEncodedExponent`, which is constant time with respect to both the
+//! base and the exponent -- the same Montgomery arithmetic the standard
+//! library verifies certificate signatures with. That is the defence that
+//! matters against a remote timing attack, and it is why this does not
+//! reimplement bignum arithmetic of its own.
+//!
+//! What it does **not** do is blind the input. Base blinding -- signing
+//! `m * r^e` and dividing the result by `r` -- additionally defends against
+//! fault attacks and against side channels in the surrounding code, and it
+//! cannot be built here: it needs a modular inverse, and `std.crypto.ff`
+//! exposes no inversion. Nor is the Chinese Remainder Theorem used, even when
+//! the key carries the parameters for it. Both are trade-offs made in the
+//! direction of code that can be read and checked.
+//!
+//! The CRT one is the expensive trade. Measured on a 2026 x86-64 laptop, in
+//! ReleaseFast:
+//!
+//! | key      | sign    | verify  |
+//! |----------|---------|---------|
+//! | 1024-bit | 1.9 ms  | 0.05 ms |
+//! | 2048-bit | 13 ms   | 0.20 ms |
+//!
+//! OpenSSL signs with a 2048-bit key in about a millisecond, so this is an
+//! order of magnitude off the pace, and nearly all of that is the missing
+//! CRT: exponentiating modulo p and modulo q separately is a quarter of the
+//! work, since the cost goes as the cube of the size. What it buys is that
+//! there is no recombination to get wrong. A CRT signer that produces one
+//! faulty half reveals the entire private key from that single bad signature
+//! -- the Bellcore attack -- so a careful one verifies every signature it
+//! makes before releasing it, which gives some of the speed straight back.
+//! For signing mail, where 13 ms disappears into the SMTP conversation
+//! around it, that machinery is not yet worth it. For a TLS server accepting
+//! connections it would be.
+//!
+//! **So: this is appropriate for signing with a key you hold on a machine you
+//! trust. It is not hardened against an attacker who can induce faults in the
+//! hardware, and it is not a replacement for an HSM.**
+//!
+//! ## Sizes
+//!
+//! The modulus ceiling is 4096 bits, which is `std.crypto.Certificate.rsa`'s
+//! ceiling too, and deliberately the same one: the field arithmetic is sized
+//! at compile time, so a key type that admitted more would cost every caller
+//! the memory for a key nobody uses. RFC 8017 has no upper bound and RFC 3766
+//! puts 4096 bits at about 140 bits of symmetric strength, which is past
+//! anything else in the stack. Raising it is the one constant below.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const crypto = std.crypto;
+const ff = crypto.ff;
+const testing = std.testing;
+
+/// The largest modulus this implementation will accept, in bits.
+///
+/// The same ceiling `std.crypto.Certificate.rsa` uses, so that a public key
+/// parsed here and one parsed from a certificate are the same field type.
+pub const max_modulus_bits = 4096;
+
+/// The largest modulus, and so the largest signature, in bytes.
+pub const max_modulus_len = max_modulus_bits / 8;
+
+/// The smallest modulus this implementation will accept, in bits.
+///
+/// 512-bit RSA was factored in 1999 and 768-bit in 2009, so this rejects only
+/// what is already broken rather than what is merely unwise; `std` draws the
+/// line in the same place and says so in the same tone. Anything new should be
+/// at 2048 at the very least -- RFC 8301 requires it of DKIM signers.
+pub const min_modulus_bits = 512;
+
+const Modulus = ff.Modulus(max_modulus_bits);
+const Fe = Modulus.Fe;
+
+/// Enough room for the DER of any secret key this module will accept.
+///
+/// A PKCS#1 `RSAPrivateKey` carries the modulus, two exponents, two primes,
+/// two reduced exponents and a coefficient: five halves and two wholes of the
+/// modulus, so about four times the modulus, plus tags and lengths. PKCS#8
+/// wraps that in about another 40 bytes. Doubling the modulus length five
+/// times over is comfortably clear of both.
+pub const max_secret_key_der = 5 * max_modulus_len + 256;
+
+/// What can go wrong reading a key out of bytes somebody else wrote.
+pub const ParseError = error{
+    /// The bytes are not well-formed DER, or not the structure expected.
+    MalformedDer,
+    /// Well-formed DER describing a key this module cannot use: a modulus
+    /// outside `min_modulus_bits`...`max_modulus_bits`, an even modulus, an
+    /// exponent that is not a usable one, or a component that is not less
+    /// than the modulus.
+    InvalidKey,
+    /// A key algorithm other than `rsaEncryption`, or a PKCS#8 version this
+    /// does not know.
+    UnsupportedKeyType,
+};
+
+/// What can go wrong turning PEM text into DER.
+pub const PemError = ParseError || error{
+    /// No `-----BEGIN ...-----` and `-----END ...-----` pair was found, or
+    /// they do not agree, or the label is not one this module knows.
+    MalformedPem,
+    /// The base64 between the markers is not valid base64.
+    InvalidBase64,
+    /// The decoded DER is larger than the buffer given.
+    BufferTooSmall,
+};
+
+// -- DER ---------------------------------------------------------------------
+//
+// `std.crypto.Certificate.der` exists and is public, but everything it returns
+// is shaped for certificates: its errors are named `CertificateFieldHas...`,
+// which is a strange thing for a private key file to tell you about, and its
+// `Element` model hands back indices into the original buffer rather than
+// slices. What is needed here is small enough that a reader of its own is
+// clearer than a translation layer.
+//
+// This is a *strict* DER reader and not a BER one. Definite lengths only, the
+// shortest possible length encoding only, and INTEGERs in the minimal form.
+// Being strict is free -- every key this will ever see was written by OpenSSL
+// or something imitating it -- and it means malformed input is rejected at the
+// door rather than somewhere further in.
+
+const tag_integer: u8 = 0x02;
+const tag_bit_string: u8 = 0x03;
+const tag_octet_string: u8 = 0x04;
+const tag_null: u8 = 0x05;
+const tag_oid: u8 = 0x06;
+const tag_sequence: u8 = 0x30;
+
+/// `1.2.840.113549.1.1.1`, PKCS#1's `rsaEncryption`, as its DER contents.
+const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+
+const Der = struct {
+    buf: []const u8,
+    i: usize = 0,
+
+    fn atEnd(self: Der) bool {
+        return self.i >= self.buf.len;
+    }
+
+    /// The contents of the next element, which must carry `tag`.
+    fn take(self: *Der, tag: u8) ParseError![]const u8 {
+        if (self.i >= self.buf.len) return error.MalformedDer;
+        if (self.buf[self.i] != tag) return error.MalformedDer;
+        self.i += 1;
+        const len = try self.takeLength();
+        if (self.buf.len - self.i < len) return error.MalformedDer;
+        defer self.i += len;
+        return self.buf[self.i..][0..len];
+    }
+
+    /// A whole element as a nested reader, for a SEQUENCE whose contents are
+    /// then read in turn.
+    fn takeSeq(self: *Der) ParseError!Der {
+        return .{ .buf = try self.take(tag_sequence) };
+    }
+
+    fn takeLength(self: *Der) ParseError!usize {
+        if (self.i >= self.buf.len) return error.MalformedDer;
+        const first = self.buf[self.i];
+        self.i += 1;
+        if (first < 0x80) return first;
+        const n = first & 0x7f;
+        // 0x80 is BER's indefinite length, which DER forbids; and a length
+        // needing more bytes than a `usize` has is not a key, it is an attack
+        // on this parser.
+        if (n == 0 or n > @sizeOf(usize)) return error.MalformedDer;
+        if (self.buf.len - self.i < n) return error.MalformedDer;
+        const bytes = self.buf[self.i..][0..n];
+        self.i += n;
+        // DER requires the shortest encoding: no leading zero byte, and
+        // nothing below 0x80 that could have been written in one byte.
+        if (bytes[0] == 0) return error.MalformedDer;
+        var len: usize = 0;
+        for (bytes) |b| len = (len << 8) | b;
+        if (len < 0x80) return error.MalformedDer;
+        return len;
+    }
+
+    /// A non-negative INTEGER's value, with the sign byte removed.
+    ///
+    /// DER writes integers two's-complement and big-endian, so a value whose
+    /// top bit is set gains a leading zero to keep it positive. Every RSA
+    /// component is positive, so that byte is noise here and is stripped --
+    /// but only where it is legitimately there, since a leading zero in front
+    /// of a byte that did not need one is a non-minimal encoding.
+    fn takeInteger(self: *Der) ParseError![]const u8 {
+        const raw = try self.take(tag_integer);
+        if (raw.len == 0) return error.MalformedDer;
+        if (raw[0] & 0x80 != 0) return error.MalformedDer; // negative
+        if (raw.len == 1) return raw; // possibly zero; the caller will reject it
+        if (raw[0] == 0 and raw[1] & 0x80 == 0) return error.MalformedDer;
+        return if (raw[0] == 0) raw[1..] else raw;
+    }
+
+    /// Checks for the `AlgorithmIdentifier` of an RSA key: the
+    /// `rsaEncryption` OID, and the explicit NULL that PKCS#1 requires after
+    /// it. Some writers omit the NULL, so it is accepted either way.
+    fn takeRsaAlgorithmIdentifier(self: *Der) ParseError!void {
+        var alg = try self.takeSeq();
+        const oid = try alg.take(tag_oid);
+        if (!std.mem.eql(u8, oid, &oid_rsa_encryption)) return error.UnsupportedKeyType;
+        if (!alg.atEnd()) _ = try alg.take(tag_null);
+        if (!alg.atEnd()) return error.MalformedDer;
+    }
+};
+
+// -- keys --------------------------------------------------------------------
+
+/// An RSA public key: a modulus and a public exponent.
+pub const PublicKey = struct {
+    /// The modulus, as the field it defines.
+    n: Modulus,
+    /// The public exponent, as an element of that field.
+    e: Fe,
+
+    /// A public key from its two components, each big-endian with any leading
+    /// zeroes already removed or not -- both are accepted.
+    ///
+    /// The argument order is modulus first, which is the order they are
+    /// written in every specification and in the DER.
+    /// (`std.crypto.Certificate.rsa.PublicKey.fromBytes` takes them the other
+    /// way round; this is the one place the two deliberately differ.)
+    pub fn fromBytes(modulus: []const u8, exponent: []const u8) ParseError!PublicKey {
+        const n = Modulus.fromBytes(modulus, .big) catch return error.InvalidKey;
+        if (n.bits() < min_modulus_bits) return error.InvalidKey;
+
+        // An exponent above 2^32 is refused for the same reason `std` refuses
+        // it: no real key has one, Windows' CryptoAPI cannot represent one,
+        // and a large public exponent is purely a way to make a verifier do
+        // work. It must also be odd and at least 3 -- an even exponent is not
+        // coprime with a modulus that is a product of odd primes, and e = 1
+        // would make the signature the message.
+        if (exponent.len > 4) return error.InvalidKey;
+        const e = Fe.fromBytes(n, exponent, .big) catch return error.InvalidKey;
+        if (!e.isOdd()) return error.InvalidKey;
+        const e_value = e.toPrimitive(u32) catch return error.InvalidKey;
+        if (e_value < 3) return error.InvalidKey;
+
+        return .{ .n = n, .e = e };
+    }
+
+    /// A public key from a PKCS#1 `RSAPublicKey`: `SEQUENCE { modulus
+    /// INTEGER, publicExponent INTEGER }`.
+    pub fn fromPkcs1Der(bytes: []const u8) ParseError!PublicKey {
+        var outer: Der = .{ .buf = bytes };
+        var seq = try outer.takeSeq();
+        const modulus = try seq.takeInteger();
+        const exponent = try seq.takeInteger();
+        if (!seq.atEnd() or !outer.atEnd()) return error.MalformedDer;
+        return fromBytes(modulus, exponent);
+    }
+
+    /// A public key from an X.509 `SubjectPublicKeyInfo`, which is what
+    /// `-----BEGIN PUBLIC KEY-----` holds and what most protocols carry.
+    pub fn fromSpkiDer(bytes: []const u8) ParseError!PublicKey {
+        var outer: Der = .{ .buf = bytes };
+        var seq = try outer.takeSeq();
+        try seq.takeRsaAlgorithmIdentifier();
+        const bit_string = try seq.take(tag_bit_string);
+        if (!seq.atEnd() or !outer.atEnd()) return error.MalformedDer;
+        // A BIT STRING's first content byte counts the unused bits in its last
+        // byte. Anything DER-wrapped in one is a whole number of bytes.
+        if (bit_string.len < 1 or bit_string[0] != 0) return error.MalformedDer;
+        return fromPkcs1Der(bit_string[1..]);
+    }
+
+    /// A public key from DER in either shape, chosen by looking at it.
+    ///
+    /// The two are told apart by what follows the outer SEQUENCE: an
+    /// `RSAPublicKey` starts with an INTEGER, a `SubjectPublicKeyInfo` with
+    /// the SEQUENCE of the algorithm identifier. This exists because formats
+    /// that carry an RSA public key as bytes are inconsistent about which one
+    /// they mean -- DKIM's DNS records are specified as
+    /// `SubjectPublicKeyInfo` but bare `RSAPublicKey` is found in the wild --
+    /// so a reader usually has to accept both.
+    pub fn fromDer(bytes: []const u8) ParseError!PublicKey {
+        var probe: Der = .{ .buf = bytes };
+        const seq = try probe.takeSeq();
+        if (seq.buf.len == 0) return error.MalformedDer;
+        return switch (seq.buf[0]) {
+            tag_integer => fromPkcs1Der(bytes),
+            tag_sequence => fromSpkiDer(bytes),
+            else => error.MalformedDer,
+        };
+    }
+
+    /// A public key from PEM text, in either DER shape.
+    ///
+    /// `der_buf` receives the decoded DER and must outlive nothing: a
+    /// `PublicKey` copies the values it needs, so the buffer may be reused as
+    /// soon as this returns.
+    pub fn fromPem(der_buf: []u8, text: []const u8) PemError!PublicKey {
+        const der_bytes = try pemDecode(der_buf, text, &.{ "PUBLIC KEY", "RSA PUBLIC KEY" });
+        return fromDer(der_bytes);
+    }
+
+    /// The modulus length in bytes, which is also the length of every
+    /// signature made with the matching secret key.
+    pub fn modulusLength(self: PublicKey) usize {
+        return std.math.divCeil(usize, self.n.bits(), 8) catch unreachable;
+    }
+};
+
+/// An RSA secret key.
+///
+/// Held by value, with the components copied in rather than pointed at, so
+/// that the DER it was parsed from can be overwritten -- which a caller
+/// holding a private key ought to be doing -- without invalidating the key.
+///
+/// The Chinese Remainder Theorem parameters are deliberately not kept: this
+/// implementation does not use them, and a secret not stored is a secret not
+/// leaked. See the note at the top of the file about what that costs.
+pub const SecretKey = struct {
+    /// The modulus, as the field it defines.
+    n: Modulus,
+    /// The private exponent, as an element of that field.
+    d: Fe,
+    /// The public exponent, kept so that `publicKey` can hand back the other
+    /// half of the pair without the caller having to carry it separately.
+    e: Fe,
+
+    /// A secret key from a PKCS#1 `RSAPrivateKey`, which is what
+    /// `-----BEGIN RSA PRIVATE KEY-----` holds.
+    ///
+    /// The CRT components are parsed to the extent of being stepped over and
+    /// checked for well-formedness, but are not retained.
+    pub fn fromPkcs1Der(bytes: []const u8) ParseError!SecretKey {
+        var outer: Der = .{ .buf = bytes };
+        var seq = try outer.takeSeq();
+
+        // Version: 0 for a two-prime key, 1 for a multi-prime one. Multi-prime
+        // keys are rejected rather than ignored -- the extra primes change
+        // nothing about n, d and e, so this *could* sign with one, but a key
+        // shape this has never been tested against is not one to guess at.
+        const version = try seq.takeInteger();
+        if (version.len != 1 or version[0] != 0) return error.UnsupportedKeyType;
+
+        const modulus = try seq.takeInteger();
+        const public_exponent = try seq.takeInteger();
+        const private_exponent = try seq.takeInteger();
+        // prime1, prime2, exponent1, exponent2, coefficient. Read and dropped:
+        // a truncated key should fail here rather than be used as if whole.
+        for (0..5) |_| _ = try seq.takeInteger();
+
+        return fromComponents(modulus, public_exponent, private_exponent);
+    }
+
+    /// A secret key from a PKCS#8 `PrivateKeyInfo`, which is what
+    /// `-----BEGIN PRIVATE KEY-----` holds and what OpenSSL has written by
+    /// default since 3.0.
+    pub fn fromPkcs8Der(bytes: []const u8) ParseError!SecretKey {
+        var outer: Der = .{ .buf = bytes };
+        var seq = try outer.takeSeq();
+
+        const version = try seq.takeInteger();
+        if (version.len != 1 or version[0] != 0) return error.UnsupportedKeyType;
+
+        try seq.takeRsaAlgorithmIdentifier();
+        const inner = try seq.take(tag_octet_string);
+        return fromPkcs1Der(inner);
+    }
+
+    /// A secret key from DER in either shape, chosen by looking at it.
+    ///
+    /// A PKCS#1 `RSAPrivateKey` and a PKCS#8 `PrivateKeyInfo` both begin
+    /// SEQUENCE, INTEGER 0, so the version does not separate them. What does
+    /// is what comes next: PKCS#1 has the modulus, another INTEGER, where
+    /// PKCS#8 has the algorithm identifier, a SEQUENCE.
+    pub fn fromDer(bytes: []const u8) ParseError!SecretKey {
+        var probe: Der = .{ .buf = bytes };
+        var seq = try probe.takeSeq();
+        _ = try seq.takeInteger();
+        if (seq.atEnd()) return error.MalformedDer;
+        return switch (seq.buf[seq.i]) {
+            tag_integer => fromPkcs1Der(bytes),
+            tag_sequence => fromPkcs8Der(bytes),
+            else => error.MalformedDer,
+        };
+    }
+
+    /// A secret key from PEM text, in either DER shape.
+    ///
+    /// `der_buf` must be at least as long as the DER inside the PEM;
+    /// `max_secret_key_der` is always enough. It holds private key material
+    /// on return and is worth wiping.
+    pub fn fromPem(der_buf: []u8, text: []const u8) PemError!SecretKey {
+        const der_bytes = try pemDecode(der_buf, text, &.{ "PRIVATE KEY", "RSA PRIVATE KEY" });
+        return fromDer(der_bytes);
+    }
+
+    fn fromComponents(
+        modulus: []const u8,
+        public_exponent: []const u8,
+        private_exponent: []const u8,
+    ) ParseError!SecretKey {
+        const public = try PublicKey.fromBytes(modulus, public_exponent);
+        // `Fe.fromBytes` rejects anything not already reduced, so this is also
+        // the check that d < n, which every valid key satisfies and a
+        // corrupted one need not.
+        const d = Fe.fromBytes(public.n, private_exponent, .big) catch return error.InvalidKey;
+        if (d.isZero()) return error.InvalidKey;
+        return .{ .n = public.n, .d = d, .e = public.e };
+    }
+
+    /// The matching public key.
+    pub fn publicKey(self: SecretKey) PublicKey {
+        return .{ .n = self.n, .e = self.e };
+    }
+
+    /// The modulus length in bytes, which is also the length of every
+    /// signature this key makes.
+    pub fn modulusLength(self: SecretKey) usize {
+        return std.math.divCeil(usize, self.n.bits(), 8) catch unreachable;
+    }
+};
+
+// -- PEM ---------------------------------------------------------------------
+
+/// Decodes the base64 body of a PEM block into `out`, returning the DER.
+///
+/// `labels` is the set of labels accepted after `BEGIN`; the `END` marker must
+/// carry the same one. Anything before the `BEGIN` line is ignored, which is
+/// what lets this read a file OpenSSL has written a human-readable dump of the
+/// key into above the block.
+fn pemDecode(out: []u8, text: []const u8, labels: []const []const u8) PemError![]u8 {
+    const begin_prefix = "-----BEGIN ";
+    const end_prefix = "-----END ";
+    const marker_suffix = "-----";
+
+    const begin = std.mem.indexOf(u8, text, begin_prefix) orelse return error.MalformedPem;
+    const label_start = begin + begin_prefix.len;
+    const label_end = std.mem.indexOfPos(u8, text, label_start, marker_suffix) orelse
+        return error.MalformedPem;
+    const label = text[label_start..label_end];
+
+    for (labels) |candidate| {
+        if (std.mem.eql(u8, label, candidate)) break;
+    } else return error.MalformedPem;
+
+    const body_start = label_end + marker_suffix.len;
+    const end = std.mem.indexOfPos(u8, text, body_start, end_prefix) orelse
+        return error.MalformedPem;
+    // The END marker has to name the same thing the BEGIN marker did,
+    // otherwise this is two overlapping blocks rather than one.
+    const end_label_start = end + end_prefix.len;
+    if (end_label_start + label.len > text.len) return error.MalformedPem;
+    if (!std.mem.eql(u8, text[end_label_start..][0..label.len], label)) return error.MalformedPem;
+
+    // The base64 is wrapped at 64 columns, so the line endings have to come
+    // out before it is decoded -- and they may be CRLF, since a key is as
+    // likely to have come through a mail message as off a disk.
+    var packed_len: usize = 0;
+    for (text[body_start..end]) |c| {
+        switch (c) {
+            ' ', '\t', '\r', '\n' => {},
+            else => {
+                if (packed_len >= out.len) return error.BufferTooSmall;
+                out[packed_len] = c;
+                packed_len += 1;
+            },
+        }
+    }
+
+    const decoder = std.base64.standard.Decoder;
+    const der_len = decoder.calcSizeForSlice(out[0..packed_len]) catch return error.InvalidBase64;
+    if (der_len > out.len) return error.BufferTooSmall;
+    // Decoding in place: the DER is three quarters the length of the base64
+    // it came from, and the decoder reads each quantum before it writes one,
+    // so the output never overtakes the input.
+    decoder.decode(out[0..der_len], out[0..packed_len]) catch return error.InvalidBase64;
+    return out[0..der_len];
+}
+
+// -- PKCS#1 v1.5 signatures --------------------------------------------------
+
+/// RFC 8017 §8.2, RSASSA-PKCS1-v1_5.
+///
+/// The padding scheme every RSA signature in the wild uses that is not PSS:
+/// TLS certificates, JWS `RS256`, DKIM, S/MIME. It is deterministic, which is
+/// the property that makes a test vector possible, and its security proof is
+/// weaker than PSS's -- but a protocol rarely gets to choose, and these all
+/// specify it.
+pub const pkcs1v1_5 = struct {
+    /// What can go wrong producing a signature.
+    pub const SignError = error{
+        /// The output buffer is shorter than the modulus.
+        BufferTooSmall,
+        /// The modulus is too short to hold this hash's padded encoding: RFC
+        /// 8017 requires at least 11 bytes of padding, so SHA-256 needs a
+        /// 62-byte modulus and SHA-512 a 94-byte one. Any real key clears
+        /// this; a 512-bit modulus with SHA-512 does not.
+        ModulusTooShort,
+    };
+
+    /// What can go wrong checking one.
+    pub const VerifyError = error{
+        /// The signature is not the length of the modulus, or is not less
+        /// than it as a number.
+        InvalidSignature,
+        /// As `SignError.ModulusTooShort`.
+        ModulusTooShort,
+    };
+
+    /// The signer and verifier for one hash function.
+    ///
+    /// `Hash` must be one of the five RFC 8017 assigns a DigestInfo prefix:
+    /// SHA-1, SHA-224, SHA-256, SHA-384 or SHA-512. Anything else is a
+    /// compile error, because there is no way to encode it.
+    pub fn Signer(comptime Hash: type) type {
+        return struct {
+            /// The DigestInfo prefix for this hash: the DER of `SEQUENCE {
+            /// AlgorithmIdentifier, OCTET STRING }` up to but not including
+            /// the digest itself. RFC 8017 §9.2 note 1 lists them, and they
+            /// are constants precisely so that nobody has to build ASN.1 at
+            /// signing time.
+            pub const digest_info_prefix: []const u8 = switch (Hash) {
+                crypto.hash.Sha1 => &.{
+                    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
+                    0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+                },
+                crypto.hash.sha2.Sha224 => &.{
+                    0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04, 0x05,
+                    0x00, 0x04, 0x1c,
+                },
+                crypto.hash.sha2.Sha256 => &.{
+                    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+                    0x00, 0x04, 0x20,
+                },
+                crypto.hash.sha2.Sha384 => &.{
+                    0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05,
+                    0x00, 0x04, 0x30,
+                },
+                crypto.hash.sha2.Sha512 => &.{
+                    0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
+                    0x00, 0x04, 0x40,
+                },
+                else => @compileError("RFC 8017 assigns no DigestInfo prefix to " ++
+                    @typeName(Hash) ++ "; PKCS#1 v1.5 cannot encode it"),
+            };
+
+            /// The length of the DigestInfo: the prefix and the digest.
+            pub const digest_info_len = digest_info_prefix.len + Hash.digest_length;
+
+            /// Signs `msg`, writing the signature to the front of `out` and
+            /// returning it. The signature is exactly as long as the modulus.
+            pub fn sign(out: []u8, msg: []const u8, secret_key: SecretKey) SignError![]u8 {
+                return signConcat(out, &.{msg}, secret_key);
+            }
+
+            /// As `sign`, over the concatenation of `parts` without joining
+            /// them in memory first.
+            pub fn signConcat(out: []u8, parts: []const []const u8, secret_key: SecretKey) SignError![]u8 {
+                var digest: [Hash.digest_length]u8 = undefined;
+                var hasher: Hash = .init(.{});
+                for (parts) |part| hasher.update(part);
+                hasher.final(&digest);
+                return signDigest(out, digest, secret_key);
+            }
+
+            /// As `sign`, given the digest rather than the message.
+            ///
+            /// This is the entry point for a protocol that hashes something
+            /// other than a contiguous message -- DKIM hashes a rewritten
+            /// version of the headers that never exists as bytes anywhere --
+            /// and for one that gets the digest from elsewhere entirely.
+            pub fn signDigest(
+                out: []u8,
+                digest: [Hash.digest_length]u8,
+                secret_key: SecretKey,
+            ) SignError![]u8 {
+                const k = secret_key.modulusLength();
+                if (out.len < k) return error.BufferTooSmall;
+                const em = out[0..k];
+                try encode(em, digest);
+
+                // s = m^d mod n. `powWithEncodedExponent` is the constant-time
+                // one; `powPublic` next to it is not, and using it here would
+                // leak the private exponent through timing.
+                //
+                // The exponent is written into exactly `k` bytes rather than
+                // the field element's full width. d < n, so it always fits,
+                // and the exponentiation walks every bit it is given: at the
+                // full 4096-bit width a 2048-bit key would pay for 2048
+                // leading zero bits it does not have.
+                var d_bytes: [max_modulus_len]u8 = undefined;
+                defer crypto.secureZero(u8, d_bytes[0..k]);
+                secret_key.d.toBytes(d_bytes[0..k], .big) catch unreachable;
+
+                const m = Fe.fromBytes(secret_key.n, em, .big) catch unreachable;
+                const s = secret_key.n.powWithEncodedExponent(m, d_bytes[0..k], .big) catch unreachable;
+                s.toBytes(em, .big) catch unreachable;
+                return em;
+            }
+
+            /// Checks `sig` against `msg`. Returns without error only if the
+            /// signature is valid.
+            pub fn verify(sig: []const u8, msg: []const u8, public_key: PublicKey) VerifyError!void {
+                return verifyConcat(sig, &.{msg}, public_key);
+            }
+
+            /// As `verify`, over the concatenation of `parts`.
+            pub fn verifyConcat(
+                sig: []const u8,
+                parts: []const []const u8,
+                public_key: PublicKey,
+            ) VerifyError!void {
+                var digest: [Hash.digest_length]u8 = undefined;
+                var hasher: Hash = .init(.{});
+                for (parts) |part| hasher.update(part);
+                hasher.final(&digest);
+                return verifyDigest(sig, digest, public_key);
+            }
+
+            /// As `verify`, given the digest rather than the message.
+            pub fn verifyDigest(
+                sig: []const u8,
+                digest: [Hash.digest_length]u8,
+                public_key: PublicKey,
+            ) VerifyError!void {
+                const k = public_key.modulusLength();
+                if (sig.len != k) return error.InvalidSignature;
+
+                // Both buffers are zeroed in full and only their first `k`
+                // bytes written, so that the comparison below can be over the
+                // whole fixed-size array -- comparing `undefined` tail bytes
+                // would be a real bug and not merely an untidy one.
+                var expected: [max_modulus_len]u8 = @splat(0);
+                encode(expected[0..k], digest) catch |err| switch (err) {
+                    error.ModulusTooShort => return error.ModulusTooShort,
+                    error.BufferTooSmall => unreachable,
+                };
+
+                // A signature is only valid if it is already reduced; one that
+                // is not is rejected rather than quietly reduced, which is
+                // what makes a signature's encoding unique.
+                const s = Fe.fromBytes(public_key.n, sig, .big) catch
+                    return error.InvalidSignature;
+                const m = public_key.n.powPublic(s, public_key.e) catch
+                    return error.InvalidSignature;
+                var actual: [max_modulus_len]u8 = @splat(0);
+                m.toBytes(actual[0..k], .big) catch unreachable;
+
+                // Nothing here is secret -- both sides are recoverable from
+                // the signature and the public key -- but comparing in
+                // constant time anyway costs nothing and means no future
+                // reader has to work out whether it mattered.
+                if (!crypto.timing_safe.eql([max_modulus_len]u8, expected, actual)) {
+                    return error.InvalidSignature;
+                }
+            }
+
+            /// EMSA-PKCS1-v1_5, RFC 8017 §9.2: fills `em` with
+            /// `0x00 || 0x01 || 0xFF... || 0x00 || DigestInfo`.
+            fn encode(em: []u8, digest: [Hash.digest_length]u8) SignError!void {
+                // §9.2 step 3: at least eight 0xFF bytes, plus the two leading
+                // bytes and the separator.
+                if (em.len < digest_info_len + 11) return error.ModulusTooShort;
+                em[0] = 0x00;
+                em[1] = 0x01;
+                const digest_info_start = em.len - digest_info_len;
+                @memset(em[2 .. digest_info_start - 1], 0xff);
+                em[digest_info_start - 1] = 0x00;
+                @memcpy(em[digest_info_start..][0..digest_info_prefix.len], digest_info_prefix);
+                @memcpy(em[em.len - digest.len ..], &digest);
+            }
+        };
+    }
+};
+
+// -- tests -------------------------------------------------------------------
+//
+// The key material and the signatures below were made by OpenSSL 3.6, which is
+// the point of them: a signature this library produces has to be byte-for-byte
+// what the rest of the world produces, and a signature the rest of the world
+// produced has to verify here. PKCS#1 v1.5 is deterministic, so "byte for
+// byte" is a test that can actually be written -- with PSS it could not be.
+//
+//     openssl genrsa -out key.pem 2048
+//     openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pkcs8.pem
+//     openssl rsa -in key.pem -pubout -out pub.spki.pem
+//     openssl dgst -sha256 -sign key.pem -out sig.bin msg.txt
+
+const Sha1 = crypto.hash.Sha1;
+const Sha256 = crypto.hash.sha2.Sha256;
+const Sha512 = crypto.hash.sha2.Sha512;
+
+const test_message = "The quick brown fox jumps over the lazy dog";
+
+/// A 2048-bit key as PKCS#8, which is what `openssl genrsa` writes now.
+const key_2048_pkcs8 =
+    "-----BEGIN PRIVATE KEY-----\n" ++
+    "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCs/p69dd+ZfZo0\n" ++
+    "w1QSBizDeh4BxqQFMO4mJ4MXnqIdLS5eD7bcCpyJQhaq+8yldafXey6ghjnNzML0\n" ++
+    "rzK8ZNtoxOluzd+lksZfDxhAP3fThp8UpAk2r63T+U4OfZcFp/sMv/BAYQxQ4Cez\n" ++
+    "4S3nwpFixzFAoy7gXgK7vhIgkb0SWAdzgcaK2ZNKZTWbt40ibHzptBWwXSTpRo13\n" ++
+    "KxkDr9kxobItqNSDI0m1rfz5SYVo8SXHKFf6HUAese7HDFxW4F79FcYf9ldnhacp\n" ++
+    "ixZJke47qo7EHAH9ANGOgbSt2pbxaSiHnPNLNE449Hk8D9aRRYMq78RxNtRu/nLV\n" ++
+    "KlQT3EcrAgMBAAECggEAMoWDz3nyrK1ZUSpwTXk/LnFl/QfJk/iHvF3Ss52w44tz\n" ++
+    "3KWDNjzlHVLPMu0phXLYax4+7kN08yznDLVzwEBGMZE8SQ9Xzs+QHmfWocDHWl+Y\n" ++
+    "6trDFBT3U44d5S55Yf3+W+lcHTkacy4bejV7hhE1C193+1QM1xqteq3WNmvJh2bx\n" ++
+    "TCtJ3aUrNXoWT+CvOv61RS7lOCL5Ck6c/IehWNkUHh7MKBBmaUu8/Hgyeer2zNHX\n" ++
+    "lmr1jzYhlzeH9q5LvoTe6eQJdoeVYZlHYsPuR0RbZRPFwZ8k+s1Y49mEcAr0BfBv\n" ++
+    "ufxs3MGzbdHRK6xlNemfBA/87H7OEhetM1SEB24WKQKBgQDrM+rf4UBrJ9RlMsSl\n" ++
+    "nVVkdBwup3i95e0CcANEZT1A9XNGj/DegBkY16oZqHyCmQrzEAKC+hSkBPuC0Zmi\n" ++
+    "Ju8Wscusb9IN6zG5V+9UegrtAnnsQ8CpZoKhpxEh48BpCNsDTzQyEt94pEFqqZDF\n" ++
+    "u+tSSpWzZb/8WTt1nhLzagKF4wKBgQC8SoyszRHP72aHxKhqNZSbhTvY18nKHW4O\n" ++
+    "oJxkjzh8QDw4XPQqEsRyhlK124aBg6TJXCddI+JRg5x/Y/kUC9V4D6YbBJ0tA3VL\n" ++
+    "WKLn2sSENdm+QcY2+5EqE49cIu4nLpb9tdDPtAieSwRu+C678tBlzrB/xh9oXiBc\n" ++
+    "A4oRSZQ8GQKBgQCKB+z2OF4yxKwsO7AWNZBQpKeJZbVBVLdUL+Jq+DMLdUCSj5Tf\n" ++
+    "LzQLVT25UxzHFAPOA35F2XfVjisAafuMoua7XdpWt0UB8B49VHLbE8hnsYVV96kQ\n" ++
+    "gV12evJd/igEPDMz7P6HyHWnelX9v8d7k74VjDnwj20tLjzr2LnsajFS2wKBgBQz\n" ++
+    "T0pOqeWMAoz4TTUv0GSq85O8+tojNCZ/lqe3MdEqtws49bz5zHeY75CxH4oPjINJ\n" ++
+    "zrNQYTxriUOlfxhmeJ1r2F83rIEiyNevh7KmJsUkXdrqhZBqhtVjydKRsMklV2+a\n" ++
+    "rO9Lmk0ZMT2ShLkHQNJbTVY39DCnQIN+obZfFXcpAoGBAJX+Poe47rrYb94m+vQq\n" ++
+    "0kJcv2VzUEXc7VmmeIANC7qJutVXqlf35s9tpZmTH3cD3JtzeY5ApYe7mYSFg9T5\n" ++
+    "dRHeqV3rXtrFQVk/1eg8j/JW6yVBrQKha5Vvt1T2VN272rFd8wicj/+n8rf90na5\n" ++
+    "RPc0GyFcbwtdATby/62XgFES\n" ++
+    "-----END PRIVATE KEY-----\n";
+
+/// The same key as PKCS#1, which is what it wrote before 3.0 and what
+/// `-traditional` still writes.
+const key_2048_pkcs1 =
+    "-----BEGIN RSA PRIVATE KEY-----\n" ++
+    "MIIEpAIBAAKCAQEArP6evXXfmX2aNMNUEgYsw3oeAcakBTDuJieDF56iHS0uXg+2\n" ++
+    "3AqciUIWqvvMpXWn13suoIY5zczC9K8yvGTbaMTpbs3fpZLGXw8YQD9304afFKQJ\n" ++
+    "Nq+t0/lODn2XBaf7DL/wQGEMUOAns+Et58KRYscxQKMu4F4Cu74SIJG9ElgHc4HG\n" ++
+    "itmTSmU1m7eNImx86bQVsF0k6UaNdysZA6/ZMaGyLajUgyNJta38+UmFaPElxyhX\n" ++
+    "+h1AHrHuxwxcVuBe/RXGH/ZXZ4WnKYsWSZHuO6qOxBwB/QDRjoG0rdqW8Wkoh5zz\n" ++
+    "SzROOPR5PA/WkUWDKu/EcTbUbv5y1SpUE9xHKwIDAQABAoIBADKFg8958qytWVEq\n" ++
+    "cE15Py5xZf0HyZP4h7xd0rOdsOOLc9ylgzY85R1SzzLtKYVy2GsePu5DdPMs5wy1\n" ++
+    "c8BARjGRPEkPV87PkB5n1qHAx1pfmOrawxQU91OOHeUueWH9/lvpXB05GnMuG3o1\n" ++
+    "e4YRNQtfd/tUDNcarXqt1jZryYdm8UwrSd2lKzV6Fk/grzr+tUUu5Tgi+QpOnPyH\n" ++
+    "oVjZFB4ezCgQZmlLvPx4Mnnq9szR15Zq9Y82IZc3h/auS76E3unkCXaHlWGZR2LD\n" ++
+    "7kdEW2UTxcGfJPrNWOPZhHAK9AXwb7n8bNzBs23R0SusZTXpnwQP/Ox+zhIXrTNU\n" ++
+    "hAduFikCgYEA6zPq3+FAayfUZTLEpZ1VZHQcLqd4veXtAnADRGU9QPVzRo/w3oAZ\n" ++
+    "GNeqGah8gpkK8xACgvoUpAT7gtGZoibvFrHLrG/SDesxuVfvVHoK7QJ57EPAqWaC\n" ++
+    "oacRIePAaQjbA080MhLfeKRBaqmQxbvrUkqVs2W//Fk7dZ4S82oCheMCgYEAvEqM\n" ++
+    "rM0Rz+9mh8SoajWUm4U72NfJyh1uDqCcZI84fEA8OFz0KhLEcoZStduGgYOkyVwn\n" ++
+    "XSPiUYOcf2P5FAvVeA+mGwSdLQN1S1ii59rEhDXZvkHGNvuRKhOPXCLuJy6W/bXQ\n" ++
+    "z7QInksEbvguu/LQZc6wf8YfaF4gXAOKEUmUPBkCgYEAigfs9jheMsSsLDuwFjWQ\n" ++
+    "UKSniWW1QVS3VC/iavgzC3VAko+U3y80C1U9uVMcxxQDzgN+Rdl31Y4rAGn7jKLm\n" ++
+    "u13aVrdFAfAePVRy2xPIZ7GFVfepEIFddnryXf4oBDwzM+z+h8h1p3pV/b/He5O+\n" ++
+    "FYw58I9tLS4869i57GoxUtsCgYAUM09KTqnljAKM+E01L9BkqvOTvPraIzQmf5an\n" ++
+    "tzHRKrcLOPW8+cx3mO+QsR+KD4yDSc6zUGE8a4lDpX8YZnida9hfN6yBIsjXr4ey\n" ++
+    "pibFJF3a6oWQaobVY8nSkbDJJVdvmqzvS5pNGTE9koS5B0DSW01WN/Qwp0CDfqG2\n" ++
+    "XxV3KQKBgQCV/j6HuO662G/eJvr0KtJCXL9lc1BF3O1ZpniADQu6ibrVV6pX9+bP\n" ++
+    "baWZkx93A9ybc3mOQKWHu5mEhYPU+XUR3qld617axUFZP9XoPI/yVuslQa0CoWuV\n" ++
+    "b7dU9lTdu9qxXfMInI//p/K3/dJ2uUT3NBshXG8LXQE28v+tl4BREg==\n" ++
+    "-----END RSA PRIVATE KEY-----\n";
+
+/// Its public half as a SubjectPublicKeyInfo.
+const pub_2048_spki =
+    "-----BEGIN PUBLIC KEY-----\n" ++
+    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArP6evXXfmX2aNMNUEgYs\n" ++
+    "w3oeAcakBTDuJieDF56iHS0uXg+23AqciUIWqvvMpXWn13suoIY5zczC9K8yvGTb\n" ++
+    "aMTpbs3fpZLGXw8YQD9304afFKQJNq+t0/lODn2XBaf7DL/wQGEMUOAns+Et58KR\n" ++
+    "YscxQKMu4F4Cu74SIJG9ElgHc4HGitmTSmU1m7eNImx86bQVsF0k6UaNdysZA6/Z\n" ++
+    "MaGyLajUgyNJta38+UmFaPElxyhX+h1AHrHuxwxcVuBe/RXGH/ZXZ4WnKYsWSZHu\n" ++
+    "O6qOxBwB/QDRjoG0rdqW8Wkoh5zzSzROOPR5PA/WkUWDKu/EcTbUbv5y1SpUE9xH\n" ++
+    "KwIDAQAB\n" ++
+    "-----END PUBLIC KEY-----\n";
+
+/// ...and as a bare PKCS#1 RSAPublicKey.
+const pub_2048_pkcs1 =
+    "-----BEGIN RSA PUBLIC KEY-----\n" ++
+    "MIIBCgKCAQEArP6evXXfmX2aNMNUEgYsw3oeAcakBTDuJieDF56iHS0uXg+23Aqc\n" ++
+    "iUIWqvvMpXWn13suoIY5zczC9K8yvGTbaMTpbs3fpZLGXw8YQD9304afFKQJNq+t\n" ++
+    "0/lODn2XBaf7DL/wQGEMUOAns+Et58KRYscxQKMu4F4Cu74SIJG9ElgHc4HGitmT\n" ++
+    "SmU1m7eNImx86bQVsF0k6UaNdysZA6/ZMaGyLajUgyNJta38+UmFaPElxyhX+h1A\n" ++
+    "HrHuxwxcVuBe/RXGH/ZXZ4WnKYsWSZHuO6qOxBwB/QDRjoG0rdqW8Wkoh5zzSzRO\n" ++
+    "OPR5PA/WkUWDKu/EcTbUbv5y1SpUE9xHKwIDAQAB\n" ++
+    "-----END RSA PUBLIC KEY-----\n";
+
+/// A 1024-bit key, because DKIM records in the wild are still full of them.
+const key_1024_pkcs1 =
+    "-----BEGIN RSA PRIVATE KEY-----\n" ++
+    "MIICXAIBAAKBgQDLXDCjq1+k0E7u9D8Y5FMkvhhr/iNo4D2KgPnEYgzO+xk0JXEL\n" ++
+    "OU8rXHSMkJIboEbTf5ZswkLwi3eqCY8afmMz4z2lU/KIRxkEBk8TyX14mKge4y5F\n" ++
+    "qj6M47OuwRWlHTiAjxMMTNHIXRnUWmdbB9+PswBrTL34WHvavqChYhsDeQIDAQAB\n" ++
+    "AoGAS4Rrp4vPU7Pra/8Vo1e+rGlPRmM0oRCMqe9lUREcMoy6ekvhI8rfZHnL6hsR\n" ++
+    "tuKZCpdZs/+bvhn8kQ9Frg/7JDMfa0880ijH16CxrDWP/2CX+VByTNZ15ivVcKS1\n" ++
+    "gSkQ1WiP69ZQrynDnx64BRLZpXZPwZCP4826mBVxvR13FFECQQDpqu47remDINad\n" ++
+    "jyjSH61n/J0Fj2WGvve+CWJ3T8nDJ28EdXgaIMO4yrzLimPwvWdUkbsi/oRRWuPI\n" ++
+    "Nv307NAtAkEA3su75SJNmvoefNZ2A5OkEwt7t9yQ9wbnBN8GSGzF6y+0jLdDEsLM\n" ++
+    "+IP42YEVkK7YdO4dvFs8N96U3L+NJ9vD/QJBAKL8kHneQAAwGqMCJXYTlG/xG1Gy\n" ++
+    "iR2o/MN4Zk9UvyY5zk0s5t5KtlqiR3guCrH0Wyv5DrBFGeRpYnLYMOHzgO0CQHz3\n" ++
+    "mfT0QMNk+CTdxmRLNATatBJ1TXrCDGLXFhcZrAo3P/aN9LlZOs9KdxLJLOdyq0cr\n" ++
+    "KNK1+hj8aFNJvktVIaECQDpYTrHjh7Cfxwk1AR4osOJdf59ecna2Fiegsn6zULpd\n" ++
+    "MVBCd5Jdjlwloxksy/1nCUvQLE+ObMYui0GltsfC0Yc=\n" ++
+    "-----END RSA PRIVATE KEY-----\n";
+
+/// `openssl dgst -sha256 -sign key2048 msg.txt`.
+const sig_2048_sha256_hex = "90c564cf0c0ff9d16bfe0ecd2630ea62a7c82d18b30f9f598a4f5896c567c7ab" ++
+    "0fd52c13897cb7b8bbbd2a5b275fa4d597a8197178b2925f8d58634481b67f68" ++
+    "013d4dbb2c0f803d528909af22b1a1e6f73e81f08cac9331f7c5606db4ed638f" ++
+    "cb3be691a34f55f59e2d045373c189a0796c5c692b866bcb72b7c2ce71af9943" ++
+    "e6355ad187a348879cc34e337c277db8679a6872906a88de473e28b46622089d" ++
+    "cbea923cd602b044a8c520ac7de6981976cdbc1a5ea82615f7ce89485a891352" ++
+    "9f4837c405c004c746594a7e3d5cde153b6418fb7f4715ddc58d8054f4185f87" ++
+    "64a2bc50eeed83f40516ddc8dd6a44e1b899fc053524586cbb25a766fbf7ba06";
+
+/// The same message under SHA-1.
+const sig_2048_sha1_hex = "2e10c80f84ce72dd5fa7df923a0b6df42a4c6602d85ea4b4a84d8a846ac1cf68" ++
+    "56710374330d921971607ac2238034e953e14abce6fd5e643e96bb4e14c96eb9" ++
+    "a221dad6d27696fa72388fb1c26ecbb26f3ab3d4b3188a11a9a8eea9febc7e9b" ++
+    "bb5af973c5b2c9a80a42ba303d1e0c977f17bf7c912bbc89e4a3c637b6af641e" ++
+    "2d82f00c1ad1864726e99f0895d9b514318e583662da741c8e7a95118c824881" ++
+    "51a9f27a27f8db3683dc936cf1369d863977e2db848a8a4ca57ca4ebbebd1de4" ++
+    "76309037ce5082a5d6dd83f896ecf3278042482366e7563669517fb43ccf081b" ++
+    "687f3e295073b13d528721fd73447cef26aff22d7c63194d098689da3d0be741";
+
+/// ...and under the 1024-bit key.
+const sig_1024_sha256_hex = "725aa5cecfc46019264c0cde0bde16ee420a94f41750585899ed1bf5795f0a56" ++
+    "96afed23f88a4c0c4bd0a5b9fdc4b58c83d930e884f06af039bb9846eb30b1ca" ++
+    "6e45cf010ba1ad1ecd66ca7d1612f73ae1dea08755c83e8e35598b1b9919a787" ++
+    "3eb4d30dc08225c4ba2214d889856fb4a572f04905810426c75708559483e81f";
+
+/// Decodes one of the hex constants above into a buffer.
+fn unhex(out: []u8, hex: []const u8) []u8 {
+    return std.fmt.hexToBytes(out, hex) catch unreachable;
+}
+
+test "PKCS#8 and PKCS#1 PEM describe the same key" {
+    var der_a: [max_secret_key_der]u8 = undefined;
+    var der_b: [max_secret_key_der]u8 = undefined;
+    const from_pkcs8 = try SecretKey.fromPem(&der_a, key_2048_pkcs8);
+    const from_pkcs1 = try SecretKey.fromPem(&der_b, key_2048_pkcs1);
+
+    try testing.expectEqual(@as(usize, 256), from_pkcs8.modulusLength());
+    try testing.expectEqual(@as(usize, 2048), from_pkcs8.n.bits());
+    try testing.expect(from_pkcs8.d.eql(from_pkcs1.d));
+    try testing.expect(from_pkcs8.e.eql(from_pkcs1.e));
+}
+
+test "SPKI and PKCS#1 public PEM describe the same key" {
+    var der_a: [max_secret_key_der]u8 = undefined;
+    var der_b: [max_secret_key_der]u8 = undefined;
+    const spki = try PublicKey.fromPem(&der_a, pub_2048_spki);
+    const pkcs1 = try PublicKey.fromPem(&der_b, pub_2048_pkcs1);
+
+    try testing.expectEqual(@as(usize, 256), spki.modulusLength());
+    try testing.expect(spki.e.eql(pkcs1.e));
+    // The moduli are the same field, so an element made from one is
+    // canonical in the other.
+    var n_a: [256]u8 = undefined;
+    var n_b: [256]u8 = undefined;
+    try spki.n.toBytes(&n_a, .big);
+    try pkcs1.n.toBytes(&n_b, .big);
+    try testing.expectEqualSlices(u8, &n_a, &n_b);
+}
+
+test "the public key derived from a secret key is the published one" {
+    var der_a: [max_secret_key_der]u8 = undefined;
+    var der_b: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der_a, key_2048_pkcs8);
+    const pk = try PublicKey.fromPem(&der_b, pub_2048_spki);
+
+    const derived = sk.publicKey();
+    try testing.expect(derived.e.eql(pk.e));
+    var n_a: [256]u8 = undefined;
+    var n_b: [256]u8 = undefined;
+    try derived.n.toBytes(&n_a, .big);
+    try pk.n.toBytes(&n_b, .big);
+    try testing.expectEqualSlices(u8, &n_a, &n_b);
+}
+
+test "signatures match OpenSSL byte for byte" {
+    var der: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der, key_2048_pkcs8);
+
+    var expected_buf: [max_modulus_len]u8 = undefined;
+    var sig_buf: [max_modulus_len]u8 = undefined;
+
+    {
+        const expected = unhex(&expected_buf, sig_2048_sha256_hex);
+        const sig = try pkcs1v1_5.Signer(Sha256).sign(&sig_buf, test_message, sk);
+        try testing.expectEqualSlices(u8, expected, sig);
+    }
+    {
+        const expected = unhex(&expected_buf, sig_2048_sha1_hex);
+        const sig = try pkcs1v1_5.Signer(Sha1).sign(&sig_buf, test_message, sk);
+        try testing.expectEqualSlices(u8, expected, sig);
+    }
+}
+
+test "a 1024-bit key signs the same way a 2048-bit one does" {
+    var der: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der, key_1024_pkcs1);
+    try testing.expectEqual(@as(usize, 128), sk.modulusLength());
+
+    var expected_buf: [max_modulus_len]u8 = undefined;
+    const expected = unhex(&expected_buf, sig_1024_sha256_hex);
+    var sig_buf: [max_modulus_len]u8 = undefined;
+    const sig = try pkcs1v1_5.Signer(Sha256).sign(&sig_buf, test_message, sk);
+    try testing.expectEqualSlices(u8, expected, sig);
+    try pkcs1v1_5.Signer(Sha256).verify(sig, test_message, sk.publicKey());
+}
+
+test "OpenSSL's signatures verify here" {
+    var der: [max_secret_key_der]u8 = undefined;
+    const pk = try PublicKey.fromPem(&der, pub_2048_spki);
+
+    var sig_buf: [max_modulus_len]u8 = undefined;
+    const sig = unhex(&sig_buf, sig_2048_sha256_hex);
+    try pkcs1v1_5.Signer(Sha256).verify(sig, test_message, pk);
+
+    // The same signature under the wrong hash must not verify, which is the
+    // check that the DigestInfo prefix is doing its job.
+    try testing.expectError(
+        error.InvalidSignature,
+        pkcs1v1_5.Signer(Sha1).verify(sig, test_message, pk),
+    );
+}
+
+test "a signature does not verify against a message it was not made over" {
+    var der: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der, key_2048_pkcs8);
+    const pk = sk.publicKey();
+
+    var sig_buf: [max_modulus_len]u8 = undefined;
+    const sig = try pkcs1v1_5.Signer(Sha256).sign(&sig_buf, test_message, sk);
+    try pkcs1v1_5.Signer(Sha256).verify(sig, test_message, pk);
+
+    try testing.expectError(
+        error.InvalidSignature,
+        pkcs1v1_5.Signer(Sha256).verify(sig, test_message ++ "!", pk),
+    );
+
+    // Every single-bit change to the signature must be rejected. This is the
+    // test that catches a comparison that stops early or a buffer that is
+    // only partly compared -- a whole-array comparison over a partly written
+    // buffer would pass the happy path above and fail here.
+    for (0..sig.len) |i| {
+        for ([_]u8{ 0x01, 0x80 }) |bit| {
+            var damaged: [max_modulus_len]u8 = undefined;
+            @memcpy(damaged[0..sig.len], sig);
+            damaged[i] ^= bit;
+            try testing.expectError(
+                error.InvalidSignature,
+                pkcs1v1_5.Signer(Sha256).verify(damaged[0..sig.len], test_message, pk),
+            );
+        }
+    }
+}
+
+test "signing over parts is signing over the join of them" {
+    var der: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der, key_2048_pkcs8);
+
+    var whole_buf: [max_modulus_len]u8 = undefined;
+    var parts_buf: [max_modulus_len]u8 = undefined;
+    const whole = try pkcs1v1_5.Signer(Sha256).sign(&whole_buf, "abcdef", sk);
+    const parts = try pkcs1v1_5.Signer(Sha256).signConcat(
+        &parts_buf,
+        &.{ "ab", "", "cde", "f" },
+        sk,
+    );
+    try testing.expectEqualSlices(u8, whole, parts);
+}
+
+test "signing a digest is signing the message that hashed to it" {
+    var der: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der, key_2048_pkcs8);
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(test_message, &digest, .{});
+
+    var a_buf: [max_modulus_len]u8 = undefined;
+    var b_buf: [max_modulus_len]u8 = undefined;
+    const from_message = try pkcs1v1_5.Signer(Sha256).sign(&a_buf, test_message, sk);
+    const from_digest = try pkcs1v1_5.Signer(Sha256).signDigest(&b_buf, digest, sk);
+    try testing.expectEqualSlices(u8, from_message, from_digest);
+}
+
+test "a modulus too short for the hash is refused rather than truncated" {
+    // SHA-512's DigestInfo is 83 bytes, so RFC 8017 needs a 94-byte modulus
+    // for it and a 1024-bit key has 128 -- but a 512-bit one has 64.
+    var der: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der, key_1024_pkcs1);
+    var sig_buf: [max_modulus_len]u8 = undefined;
+    // 1024 bits is enough for SHA-512, so this one works...
+    _ = try pkcs1v1_5.Signer(Sha512).sign(&sig_buf, test_message, sk);
+    // ...and the buffer check is what a caller gets for being careless.
+    try testing.expectError(
+        error.BufferTooSmall,
+        pkcs1v1_5.Signer(Sha512).sign(sig_buf[0..64], test_message, sk),
+    );
+}
+
+test "the encoded message is what RFC 8017 section 9.2 describes" {
+    // EM = 0x00 || 0x01 || 0xFF... || 0x00 || DigestInfo, and the DigestInfo
+    // is the prefix followed by the digest.
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(test_message, &digest, .{});
+
+    const Signer = pkcs1v1_5.Signer(Sha256);
+    var em: [256]u8 = undefined;
+    try Signer.encode(&em, digest);
+
+    try testing.expectEqual(@as(u8, 0x00), em[0]);
+    try testing.expectEqual(@as(u8, 0x01), em[1]);
+    const info_start = em.len - Signer.digest_info_len;
+    for (em[2 .. info_start - 1]) |b| try testing.expectEqual(@as(u8, 0xff), b);
+    try testing.expectEqual(@as(u8, 0x00), em[info_start - 1]);
+    try testing.expectEqualSlices(
+        u8,
+        Signer.digest_info_prefix,
+        em[info_start..][0..Signer.digest_info_prefix.len],
+    );
+    try testing.expectEqualSlices(u8, &digest, em[em.len - digest.len ..]);
+    // At least eight 0xFF bytes, which is the whole of step 3.
+    try testing.expect(info_start - 3 >= 8);
+}
+
+test "malformed keys are rejected rather than misread" {
+    var der: [max_secret_key_der]u8 = undefined;
+
+    // Not PEM at all.
+    try testing.expectError(error.MalformedPem, SecretKey.fromPem(&der, "hello"));
+    // A label this function does not accept.
+    try testing.expectError(error.MalformedPem, SecretKey.fromPem(&der, pub_2048_spki));
+    // Markers that disagree.
+    try testing.expectError(error.MalformedPem, SecretKey.fromPem(&der,
+        \\-----BEGIN PRIVATE KEY-----
+        \\MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu
+        \\-----END PUBLIC KEY-----
+        \\
+    ));
+    // Base64 that is not.
+    try testing.expectError(error.InvalidBase64, SecretKey.fromPem(&der,
+        \\-----BEGIN PRIVATE KEY-----
+        \\!!!!
+        \\-----END PRIVATE KEY-----
+        \\
+    ));
+    // Valid base64, valid length, but not the DER of anything.
+    try testing.expectError(error.MalformedDer, SecretKey.fromPem(&der,
+        \\-----BEGIN PRIVATE KEY-----
+        \\AAAAAAAAAAAA
+        \\-----END PRIVATE KEY-----
+        \\
+    ));
+}
+
+test "a truncated key is rejected, not used as if whole" {
+    // Cutting the DER short anywhere has to be an error: the components are
+    // read in order, so a key missing its coefficient still has everything
+    // this implementation *uses*, and accepting it would mean accepting a
+    // file that is not a key.
+    var full: [max_secret_key_der]u8 = undefined;
+    const der_bytes = try pemDecode(&full, key_2048_pkcs8, &.{"PRIVATE KEY"});
+
+    var i: usize = 1;
+    while (i < der_bytes.len) : (i += 7) {
+        try testing.expectError(error.MalformedDer, SecretKey.fromDer(der_bytes[0..i]));
+    }
+}
+
+test "DER that is well-formed but describes an unusable key" {
+    // A 256-bit modulus: real DER, real structure, a key nobody should be
+    // allowed to use. Built by hand because OpenSSL will not generate one.
+    //   SEQUENCE { INTEGER 0, INTEGER n, INTEGER 65537, INTEGER d,
+    //              INTEGER 0 x5 }
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const n = [_]u8{0xc0} ++ [_]u8{0x01} ** 30 ++ [_]u8{0x01}; // 256 bits, odd
+    const d = [_]u8{0x11} ++ [_]u8{0x22} ** 30 ++ [_]u8{0x33};
+
+    var body: [512]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&body);
+    try bw.writeAll(&.{ 0x02, 0x01, 0x00 }); // version 0
+    try bw.writeAll(&.{ 0x02, @intCast(n.len + 1), 0x00 }); // n, with sign byte
+    try bw.writeAll(&n);
+    try bw.writeAll(&.{ 0x02, 0x03, 0x01, 0x00, 0x01 }); // e = 65537
+    try bw.writeAll(&.{ 0x02, @intCast(d.len) }); // d
+    try bw.writeAll(&d);
+    for (0..5) |_| try bw.writeAll(&.{ 0x02, 0x01, 0x01 }); // the CRT values
+    const body_bytes = bw.buffered();
+
+    // The short form, because the body is under 0x80 bytes and this reader
+    // insists on the shortest encoding -- writing `0x81, len` here would be
+    // rejected as malformed before it ever got as far as looking at the key.
+    try testing.expect(body_bytes.len < 0x80);
+    try w.writeAll(&.{ 0x30, @intCast(body_bytes.len) });
+    try w.writeAll(body_bytes);
+
+    try testing.expectError(error.InvalidKey, SecretKey.fromDer(w.buffered()));
+}
+
+test "a public exponent that is not usable is refused" {
+    // e must be odd and at least 3: an even one is not coprime with n, and
+    // e = 1 would make the signature the message.
+    const n = [_]u8{0xc0} ++ [_]u8{0xff} ** 126 ++ [_]u8{0x01}; // 1024 bits
+    try testing.expectError(error.InvalidKey, PublicKey.fromBytes(&n, &.{0x01}));
+    try testing.expectError(error.InvalidKey, PublicKey.fromBytes(&n, &.{0x02}));
+    try testing.expectError(error.InvalidKey, PublicKey.fromBytes(&n, &.{ 0x01, 0x00, 0x00, 0x00, 0x01 }));
+    _ = try PublicKey.fromBytes(&n, &.{0x03});
+    _ = try PublicKey.fromBytes(&n, &.{ 0x01, 0x00, 0x01 });
+}
+
+test "a modulus below the floor is refused" {
+    const short = [_]u8{0xc0} ++ [_]u8{0xff} ** 30 ++ [_]u8{0x01}; // 256 bits
+    try testing.expectError(
+        error.InvalidKey,
+        PublicKey.fromBytes(&short, &.{ 0x01, 0x00, 0x01 }),
+    );
+}
+
+test "PEM with CRLF line endings, and with noise above the block" {
+    // A key that has been through a mail message has CRLF, and one dumped by
+    // `openssl rsa -text` has its own description above the block.
+    var crlf_buf: [4096]u8 = undefined;
+    var len: usize = 0;
+    const preamble = "Private-Key: (2048 bit, 2 primes)\nmodulus: ...\n";
+    @memcpy(crlf_buf[0..preamble.len], preamble);
+    len = preamble.len;
+    for (key_2048_pkcs8) |c| {
+        if (c == '\n') {
+            crlf_buf[len] = '\r';
+            len += 1;
+        }
+        crlf_buf[len] = c;
+        len += 1;
+    }
+
+    var der: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der, crlf_buf[0..len]);
+    try testing.expectEqual(@as(usize, 2048), sk.n.bits());
+}

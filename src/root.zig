@@ -68,6 +68,10 @@ pub const modes = @import("modes.zig");
 /// between. Encryption only, because CFB and CTR never run a cipher
 /// backwards -- the file says more.
 pub const aes192 = @import("aes192.zig");
+/// RSA signing, which `std.crypto` leaves out: it ships a verifier, buried in
+/// the certificate parser, and no private key type at all. The file says what
+/// that costs and what this does and does not promise.
+pub const rsa = @import("rsa.zig");
 
 /// The pieces a caller reaches for most often, spelled without the layer in
 /// between.
@@ -87,4 +91,5 @@ test {
     _ = cipher;
     _ = modes;
     _ = aes192;
+    _ = rsa;
 }

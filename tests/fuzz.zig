@@ -31,6 +31,8 @@ const modes = des.modes;
 const Aes128 = std.crypto.core.aes.Aes128;
 const Aes192 = des.Aes192;
 const AesEncryptCtx = std.crypto.core.aes.AesEncryptCtx;
+const rsa = des.rsa;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Unused here -- nothing in this library allocates -- but the standalone
 /// driver sets it, so it has to exist.
@@ -257,6 +259,166 @@ test "the mode boundaries, at every interesting length" {
     }
 }
 
+// -- RSA key parsing ---------------------------------------------------------
+
+/// A real 1024-bit PKCS#8 private key, as DER. The seed that matters: a
+/// mutation of something structurally valid reaches far deeper into the
+/// parser than any amount of random noise ever will.
+const key_1024_der_hex = "30820276020100300d06092a864886f70d0101010500048202603082025c0201" ++
+    "0002818100cb5c30a3ab5fa4d04eeef43f18e45324be186bfe2368e03d8a80f9" ++
+    "c4620ccefb193425710b394f2b5c748c90921ba046d37f966cc242f08b77aa09" ++
+    "8f1a7e6333e33da553f288471904064f13c97d7898a81ee32e45aa3e8ce3b3ae" ++
+    "c115a51d38808f130c4cd1c85d19d45a675b07df8fb3006b4cbdf8587bdabea0" ++
+    "a1621b037902030100010281804b846ba78bcf53b3eb6bff15a357beac694f46" ++
+    "6334a1108ca9ef6551111c328cba7a4be123cadf6479cbea1b11b6e2990a9759" ++
+    "b3ff9bbe19fc910f45ae0ffb24331f6b4f3cd228c7d7a0b1ac358fff6097f950" ++
+    "724cd675e62bd570a4b5812910d5688febd650af29c39f1eb80512d9a5764fc1" ++
+    "908fe3cdba981571bd1d771451024100e9aaee3bade98320d69d8f28d21fad67" ++
+    "fc9d058f6586bef7be0962774fc9c3276f0475781a20c3b8cabccb8a63f0bd67" ++
+    "5491bb22fe84515ae3c836fdf4ecd02d024100decbbbe5224d9afa1e7cd67603" ++
+    "93a4130b7bb7dc90f706e704df06486cc5eb2fb48cb74312c2ccf883f8d98115" ++
+    "90aed874ee1dbc5b3c37de94dcbf8d27dbc3fd024100a2fc9079de4000301aa3" ++
+    "02257613946ff11b51b2891da8fcc378664f54bf2639ce4d2ce6de4ab65aa247" ++
+    "782e0ab1f45b2bf90eb04519e4696272d830e1f380ed02407cf799f4f440c364" ++
+    "f824ddc6644b3404dab412754d7ac20c62d7161719ac0a373ff68df4b9593acf" ++
+    "4a7712c92ce772ab472b28d2b5fa18fc685349be4b5521a102403a584eb1e387" ++
+    "b09fc70935011e28b0e25d7f9f5e7276b61627a0b27eb350ba5d31504277925d" ++
+    "8e5c25a3192ccbfd67094bd02c4f8e6cc62e8b41a5b6c7c2d187";
+
+/// Its public half, as a SubjectPublicKeyInfo.
+const pub_1024_der_hex = "30819f300d06092a864886f70d010101050003818d0030818902818100cb5c30" ++
+    "a3ab5fa4d04eeef43f18e45324be186bfe2368e03d8a80f9c4620ccefb193425" ++
+    "710b394f2b5c748c90921ba046d37f966cc242f08b77aa098f1a7e6333e33da5" ++
+    "53f288471904064f13c97d7898a81ee32e45aa3e8ce3b3aec115a51d38808f13" ++
+    "0c4cd1c85d19d45a675b07df8fb3006b4cbdf8587bdabea0a1621b0379020301" ++
+    "0001";
+
+/// Decodes one of the hex constants above at run time.
+fn unhexAlloc(out: []u8, hex: []const u8) []const u8 {
+    return std.fmt.hexToBytes(out, hex) catch unreachable;
+}
+
+/// The key parsers, which are the only part of this library that reads
+/// anything an attacker wrote.
+///
+/// A cipher has no parser to confuse; a DER reader is nothing but. The
+/// property is the weak one on purpose -- return a key or return an error,
+/// but do not read outside the buffer, do not recurse without bound, and do
+/// not spin. Anything stronger would be asserting what *should* come back
+/// from bytes that are not a key, and for almost all of them nothing should.
+///
+/// The one real assertion is at the end: whatever a parsed key claims about
+/// its own size has to be a size this library can actually work with, because
+/// everything downstream indexes buffers by it.
+fn keyParseProperty(input: []const u8) !void {
+    var der_buf: [rsa.max_secret_key_der]u8 = undefined;
+
+    if (rsa.SecretKey.fromDer(input)) |sk| {
+        try checkSize(sk.n.bits(), sk.modulusLength());
+        try checkSize(sk.publicKey().n.bits(), sk.publicKey().modulusLength());
+    } else |_| {}
+
+    if (rsa.PublicKey.fromDer(input)) |pk| {
+        try checkSize(pk.n.bits(), pk.modulusLength());
+    } else |_| {}
+
+    // The PEM readers get the same bytes as text. Mostly they will not find a
+    // marker at all, which is the point: the search for one runs over
+    // arbitrary input.
+    if (rsa.SecretKey.fromPem(&der_buf, input)) |sk| {
+        try checkSize(sk.n.bits(), sk.modulusLength());
+    } else |_| {}
+    if (rsa.PublicKey.fromPem(&der_buf, input)) |pk| {
+        try checkSize(pk.n.bits(), pk.modulusLength());
+    } else |_| {}
+
+    // And into a buffer far too small for any key, since  is
+    // a path of its own and one a caller can easily reach.
+    var tiny: [16]u8 = undefined;
+    if (rsa.SecretKey.fromPem(&tiny, input)) |_| {} else |_| {}
+}
+
+fn checkSize(bits: usize, len: usize) !void {
+    try testing.expect(bits >= 512 and bits <= rsa.max_modulus_bits);
+    try testing.expect(len <= rsa.max_modulus_len);
+    try testing.expectEqual((bits + 7) / 8, len);
+}
+
+test "fuzz rsa key parsing" {
+    var scratch: [1024]u8 = undefined;
+    try keyParseProperty(unhexAlloc(&scratch, key_1024_der_hex));
+    try keyParseProperty(unhexAlloc(&scratch, pub_1024_der_hex));
+    for (key_seeds) |seed| try keyParseProperty(seed);
+    try testing.fuzz({}, fuzzKeyParse, .{});
+}
+
+fn fuzzKeyParse(_: void, smith: *Smith) !void {
+    var buffer: [2048]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try keyParseProperty(buffer[0..len]);
+}
+
+/// Verification against bytes nobody signed, which must always be refused.
+///
+/// This is the property worth having: a verifier that accepts something is a
+/// catastrophe, where a verifier that rejects something is at worst a bug
+/// report. The chance of the fuzzer stumbling on a valid signature is nil, so
+/// every input here is a forgery attempt and every one of them has to fail.
+fn verifyForgeryProperty(input: []const u8) !void {
+    var scratch: [1024]u8 = undefined;
+    const pk = rsa.PublicKey.fromDer(unhexAlloc(&scratch, pub_1024_der_hex)) catch unreachable;
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(input, &digest, .{});
+
+    // A signature of the right length is the interesting case -- the wrong
+    // length is refused before any arithmetic happens -- so pad or truncate
+    // the input to the modulus rather than testing the easy rejection.
+    var sig: [rsa.max_modulus_len]u8 = @splat(0);
+    const k = pk.modulusLength();
+    const n = @min(input.len, k);
+    @memcpy(sig[k - n ..][0..n], input[0..n]);
+
+    try testing.expectError(
+        error.InvalidSignature,
+        rsa.pkcs1v1_5.Signer(Sha256).verifyDigest(sig[0..k], digest, pk),
+    );
+    // ...and the lengths that are not the modulus, which must also fail and
+    // must not index off the end of anything while doing it.
+    for ([_]usize{ 0, 1, k - 1, k + 1, rsa.max_modulus_len }) |len| {
+        try testing.expectError(
+            error.InvalidSignature,
+            rsa.pkcs1v1_5.Signer(Sha256).verifyDigest(sig[0..len], digest, pk),
+        );
+    }
+}
+
+test "fuzz rsa verify" {
+    for (key_seeds) |seed| try verifyForgeryProperty(seed);
+    try testing.fuzz({}, fuzzVerify, .{});
+}
+
+fn fuzzVerify(_: void, smith: *Smith) !void {
+    var buffer: [256]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try verifyForgeryProperty(buffer[0..len]);
+}
+
+/// Seeds for both: the shapes a parser gets wrong before it gets anything
+/// else wrong -- empty, a bare tag, a length with no content, a length that
+/// claims more than there is, and the two PEM markers with nothing between.
+const key_seeds = [_][]const u8{
+    "",
+    "\x30",
+    "\x30\x00",
+    "\x30\x82\xff\xff",
+    "\x30\x80\x02\x01\x00",
+    "\x02\x01\x00",
+    "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n",
+    "-----BEGIN PUBLIC KEY-----\nAA==\n-----END PUBLIC KEY-----\n",
+    "-----BEGIN PRIVATE KEY-----",
+};
+
 // -- the table the standalone driver reads ----------------------------------
 
 pub const Target = struct {
@@ -298,5 +460,17 @@ pub const all = [_]Target{
         .run = Driven(fuzzCipher).run,
         .corpus = &cipher_seeds,
         .content_max = 64,
+    },
+    .{
+        .name = "key-parse",
+        .run = Driven(fuzzKeyParse).run,
+        .corpus = &key_seeds,
+        .content_max = 2048,
+    },
+    .{
+        .name = "verify",
+        .run = Driven(fuzzVerify).run,
+        .corpus = &key_seeds,
+        .content_max = 256,
     },
 };
