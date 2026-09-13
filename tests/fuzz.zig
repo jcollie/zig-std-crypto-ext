@@ -404,9 +404,39 @@ fn fuzzVerify(_: void, smith: *Smith) !void {
     try verifyForgeryProperty(buffer[0..len]);
 }
 
+/// A well-formed PKCS#1 `RSAPublicKey` whose modulus is `modulus_len` bytes
+/// with the top bit set, built at compile time.
+///
+/// It exists for the seed below. The upper bound on the modulus is the
+/// check `checkSize` exists to enforce, and a fuzzer mutating 1024-bit keys
+/// never produces a 4104-bit one on its own -- which is how a missing upper
+/// bound stayed missing through half a million iterations. A seed sitting
+/// just past the ceiling, and its mutations sitting either side of it, is
+/// what makes that property reachable.
+fn publicKeyDerOfSize(comptime modulus_len: usize) [4 + 4 + 1 + modulus_len + 5]u8 {
+    @setEvalBranchQuota(10_000);
+    const n_len = modulus_len + 1; // a sign byte, since the top bit is set
+    const e = [_]u8{ 0x02, 0x03, 0x01, 0x00, 0x01 };
+    const body_len = 4 + n_len + e.len;
+    var out: [4 + body_len]u8 = undefined;
+    out[0..4].* = .{ 0x30, 0x82, body_len >> 8, body_len & 0xff };
+    out[4..9].* = .{ 0x02, 0x82, n_len >> 8, n_len & 0xff, 0x00 };
+    out[9] = 0xc0;
+    @memset(out[10 .. 9 + modulus_len - 1], 0x11);
+    out[9 + modulus_len - 1] = 0x01;
+    out[9 + modulus_len ..][0..e.len].* = e;
+    return out;
+}
+
+/// Eight bits past `max_modulus_bits`: accepted by `std.crypto.ff`'s field,
+/// which is sized in 63-bit limbs and so reaches 4158 bits, and exactly what
+/// the parser has to refuse.
+const oversized_public_key_der = publicKeyDerOfSize(513);
+
 /// Seeds for both: the shapes a parser gets wrong before it gets anything
 /// else wrong -- empty, a bare tag, a length with no content, a length that
 /// claims more than there is, and the two PEM markers with nothing between.
+/// And one key that is too large by a byte, for the reason given on it.
 const key_seeds = [_][]const u8{
     "",
     "\x30",
@@ -417,6 +447,7 @@ const key_seeds = [_][]const u8{
     "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n",
     "-----BEGIN PUBLIC KEY-----\nAA==\n-----END PUBLIC KEY-----\n",
     "-----BEGIN PRIVATE KEY-----",
+    &oversized_public_key_der,
 };
 
 // -- the table the standalone driver reads ----------------------------------

@@ -479,6 +479,9 @@ pub const Des3 = struct {
     /// older protocols and weaker than it looks.
     pub fn initEnc2(key: [16]u8) EncryptCtx {
         var full: [key_length]u8 = undefined;
+        // A second copy of the key, and one the caller does not know about,
+        // so it does not outlive this call on the stack.
+        defer std.crypto.secureZero(u8, &full);
         @memcpy(full[0..16], &key);
         @memcpy(full[16..24], key[0..8]);
         return initEnc(full);
@@ -486,6 +489,7 @@ pub const Des3 = struct {
 
     pub fn initDec2(key: [16]u8) DecryptCtx {
         var full: [key_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &full);
         @memcpy(full[0..16], &key);
         @memcpy(full[16..24], key[0..8]);
         return initDec(full);

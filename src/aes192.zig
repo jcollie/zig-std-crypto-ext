@@ -19,6 +19,38 @@
 //! interoperability with deployed equipment rather than conformance to
 //! anything.
 //!
+//! ## Built on `std`'s rounds, which is where the timing comes from
+//!
+//! What `std` does export is the round: `std.crypto.core.aes.Block` has
+//! `encrypt` and `encryptLast`, one AES round each with a round key, and on
+//! x86-64 with AES-NI and AArch64 with the crypto extension those are single
+//! instructions. Twelve of them in a row with AES-192's round keys is
+//! AES-192, and the only thing this file has to supply of its own is the key
+//! schedule. So that is all it supplies.
+//!
+//! That is not a convenience but the whole of the cipher's side-channel
+//! story. An AES written out in software indexes a 256-byte S-box by a byte
+//! of key-mixed state sixteen times a round, and which cache line that lands
+//! in is the leak Bernstein (2005) and Osvik, Shamir and Tromer (2006)
+//! recovered keys through, remotely in Bernstein's case. An earlier version
+//! of this file did exactly that -- `movzx r8d, byte ptr [rsi + sbox]` in the
+//! release build, with the index straight out of the state -- next door to
+//! a DES that goes to some lengths to avoid it. Running on `Block` instead
+//! means this cipher has precisely the timing properties `std`'s own
+//! `Aes128` has on the same machine: constant-time where
+//! `std.crypto.core.aes.has_hardware_support` is true, and `std`'s software
+//! fallback where it is not. Whether it is true depends on the target CPU
+//! the build was given and not on the machine it runs on -- `-Dcpu=baseline`
+//! on x86-64 has no AES-NI, and that is what a Nix package build passes --
+//! so a deployment that cares checks that constant at build time.
+//!
+//! The key schedule's own S-box lookups -- four per expanded word, once per
+//! key -- go through the same hardware round: `subWord` puts the four bytes
+//! in the row that `ShiftRows` leaves where it is and runs `encryptLast`
+//! with a zero round key, which is `SubBytes` and nothing else on those
+//! bytes. The one table left in this file is read only by the tests, to
+//! check that trick against FIPS 197's printed S-box.
+//!
 //! ## Encryption only, and why that is not a gap
 //!
 //! There is `initEnc` and no `initDec`, because the only thing that needs
@@ -31,9 +63,9 @@
 //!
 //! Asking for `Aes192.initDec` is therefore a compile error naming the
 //! missing declaration, which is a better way to find this out than a runtime
-//! surprise. Adding it later is additive: the inverse cipher needs the
-//! inverse S-box and `InvMixColumns`, and nothing about the layout here would
-//! have to change.
+//! surprise. Adding it later is additive: `Block` has `decrypt` and
+//! `decryptLast` too, and the inverse schedule is the forward one with
+//! `InvMixColumns` over the middle round keys, which `Block` can also do.
 //!
 //! ## Shape
 //!
@@ -45,35 +77,33 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
-
-/// Rijndael's S-box, as FIPS 197 Figure 7 prints it.
-const sbox = [256]u8{
-    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
-    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
-    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
-    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
-    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
-    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
-    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
-    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
-    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
-    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
-    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
-    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
-    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
-    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
-    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
-    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
-};
+const Block = std.crypto.core.aes.Block;
 
 /// The round constants, `x^(i-1)` in GF(2^8). Only eight are needed for
 /// AES-192's 52-word expansion; AES-128 needs ten, which is the one place a
 /// smaller key does *more* key-schedule work.
 const rcon = [_]u8{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
 
-/// Multiplication by x in GF(2^8) modulo Rijndael's polynomial.
-fn xtime(a: u8) u8 {
-    return (a << 1) ^ (if (a & 0x80 != 0) @as(u8, 0x1b) else 0);
+/// `SubWord`: FIPS 197's S-box applied to each of four bytes, done by the
+/// hardware round rather than by a table.
+///
+/// `Block.encryptLast` is `ShiftRows`, `SubBytes`, then XOR with the round
+/// key. The state is column-major, so bytes 0, 4, 8 and 12 are row 0, and
+/// row 0 is the one row `ShiftRows` does not move. Put the word there, use a
+/// zero round key, and what comes back in those four positions is the S-box
+/// of what went in and nothing else. This is what `aeskeygenassist` does for
+/// the key sizes `std` supports, and the reason to do it this way rather than
+/// index a table is the same as for the cipher itself: a table lookup by a
+/// byte of the key is a cache-timing leak, and the key schedule is made of
+/// nothing but bytes of the key.
+fn subWord(word: [4]u8) [4]u8 {
+    var lane: [16]u8 = @splat(0);
+    lane[0] = word[0];
+    lane[4] = word[1];
+    lane[8] = word[2];
+    lane[12] = word[3];
+    const out = Block.fromBytes(&lane).encryptLast(Block.fromBytes(&@splat(0))).toBytes();
+    return .{ out[0], out[4], out[8], out[12] };
 }
 
 /// AES-192: a 24-octet key and twelve rounds.
@@ -96,32 +126,27 @@ pub const Aes192 = struct {
 
     pub const EncryptCtx = struct {
         pub const block_length = Aes192.block_length;
-        /// Thirteen round keys of sixteen octets: the initial AddRoundKey and
-        /// one per round.
-        round_keys: [(rounds + 1) * 16]u8,
+        /// Thirteen round keys: the initial AddRoundKey and one per round,
+        /// each already in the form `Block` wants so that nothing is
+        /// converted per block.
+        round_keys: [rounds + 1]Block,
 
         pub fn encrypt(
             ctx: EncryptCtx,
             dst: *[Aes192.block_length]u8,
             src: *const [Aes192.block_length]u8,
         ) void {
-            var state: [16]u8 = src.*;
-            addRoundKey(&state, ctx.round_keys[0..16]);
-
-            var round: usize = 1;
-            while (round < rounds) : (round += 1) {
-                subBytes(&state);
-                shiftRows(&state);
-                mixColumns(&state);
-                addRoundKey(&state, ctx.round_keys[round * 16 ..][0..16]);
+            var state = Block.fromBytes(src).xorBlocks(ctx.round_keys[0]);
+            // Unrolled, as `std` unrolls its own, so that the round keys
+            // are addressed at constant offsets.
+            comptime var round = 1;
+            inline while (round < rounds) : (round += 1) {
+                state = state.encrypt(ctx.round_keys[round]);
             }
             // The last round omits MixColumns, which is what makes the
             // inverse cipher's rounds line up.
-            subBytes(&state);
-            shiftRows(&state);
-            addRoundKey(&state, ctx.round_keys[rounds * 16 ..][0..16]);
-
-            dst.* = state;
+            state = state.encryptLast(ctx.round_keys[rounds]);
+            dst.* = state.toBytes();
         }
     };
 
@@ -133,10 +158,13 @@ pub const Aes192 = struct {
     /// SubWord at `i % Nk == 4`, which is why a reading generic over Nk has
     /// to guard that on `Nk > 6` -- and why AES-192 is not simply AES-256
     /// with a shorter key.
-    fn expandKey(key: [key_length]u8) [(rounds + 1) * 16]u8 {
+    fn expandKey(key: [key_length]u8) [rounds + 1]Block {
         const words_in_key = key_length / 4; // 6
         const total_words = (rounds + 1) * 4; // 52
         var w: [total_words][4]u8 = undefined;
+        // The whole schedule sits here until it has been repacked, and it is
+        // the key, so it does not stay on the stack afterwards.
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&w));
 
         for (0..words_in_key) |i| {
             w[i] = key[i * 4 ..][0..4].*;
@@ -158,8 +186,7 @@ pub const Aes192 = struct {
                 // FIPS 197 known answer that caught it, and the divergence
                 // was a single byte of the *first* expanded word.
                 const rotated: [4]u8 = .{ t[1], t[2], t[3], t[0] };
-                t = rotated;
-                for (&t) |*byte| byte.* = sbox[byte.*];
+                t = subWord(rotated);
                 t[0] ^= rcon[i / words_in_key - 1];
             }
             // No `else if (i % words_in_key == 4)` branch: that step belongs
@@ -170,52 +197,15 @@ pub const Aes192 = struct {
             }
         }
 
-        var round_keys: [(rounds + 1) * 16]u8 = undefined;
-        for (0..total_words) |i| {
-            @memcpy(round_keys[i * 4 ..][0..4], &w[i]);
+        var round_keys: [rounds + 1]Block = undefined;
+        for (&round_keys, 0..) |*round_key, r| {
+            var bytes: [16]u8 = undefined;
+            for (0..4) |c| bytes[c * 4 ..][0..4].* = w[r * 4 + c];
+            round_key.* = Block.fromBytes(&bytes);
         }
         return round_keys;
     }
 };
-
-fn addRoundKey(state: *[16]u8, round_key: *const [16]u8) void {
-    for (state, round_key) |*byte, key_byte| byte.* ^= key_byte;
-}
-
-fn subBytes(state: *[16]u8) void {
-    for (state) |*byte| byte.* = sbox[byte.*];
-}
-
-/// Row `r` rotated left by `r`. The state is column-major -- byte `r + 4c` is
-/// row r, column c -- which is why this does not look like a rotation.
-fn shiftRows(state: *[16]u8) void {
-    // The copy is load bearing for the same reason the temporary in
-    // `expandKey` is: assigning an array from a literal built out of itself
-    // happens element by element in place, so a permutation written without
-    // a copy reads values it has already overwritten.
-    const s = state.*;
-    state.* = .{
-        s[0],  s[5],  s[10], s[15],
-        s[4],  s[9],  s[14], s[3],
-        s[8],  s[13], s[2],  s[7],
-        s[12], s[1],  s[6],  s[11],
-    };
-}
-
-fn mixColumns(state: *[16]u8) void {
-    var column: usize = 0;
-    while (column < 4) : (column += 1) {
-        const c = state[column * 4 ..][0..4];
-        const a0 = c[0];
-        const a1 = c[1];
-        const a2 = c[2];
-        const a3 = c[3];
-        c[0] = xtime(a0) ^ (xtime(a1) ^ a1) ^ a2 ^ a3;
-        c[1] = a0 ^ xtime(a1) ^ (xtime(a2) ^ a2) ^ a3;
-        c[2] = a0 ^ a1 ^ xtime(a2) ^ (xtime(a3) ^ a3);
-        c[3] = (xtime(a0) ^ a0) ^ a1 ^ a2 ^ xtime(a3);
-    }
-}
 
 // -- tests ------------------------------------------------------------------
 //
@@ -226,6 +216,27 @@ fn mixColumns(state: *[16]u8) void {
 // number transcribed from memory is worth no more than the memory.
 //
 //   openssl enc -aes-192-ecb -nopad -K <48 hex digits> -in block.bin
+
+/// Rijndael's S-box, as FIPS 197 Figure 7 prints it. Read by nothing but the
+/// tests: it is what `subWord`'s answer is checked against, byte by byte.
+const sbox = [256]u8{
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+};
 
 fn expectBlock(key: [24]u8, plaintext: [16]u8, expected: [16]u8) !void {
     var out: [16]u8 = undefined;
@@ -304,8 +315,26 @@ test "twelve rounds, thirteen round keys, and the first is the key itself" {
     var key: [24]u8 = undefined;
     for (&key, 0..) |*byte, i| byte.* = @intCast(i);
     const ctx = Aes192.initEnc(key);
-    try testing.expectEqualSlices(u8, &key, ctx.round_keys[0..24]);
-    try testing.expectEqual(@as(usize, 13 * 16), ctx.round_keys.len);
+    try testing.expectEqual(@as(usize, 13), ctx.round_keys.len);
+    var schedule_head: [32]u8 = undefined;
+    schedule_head[0..16].* = ctx.round_keys[0].toBytes();
+    schedule_head[16..32].* = ctx.round_keys[1].toBytes();
+    try testing.expectEqualSlices(u8, &key, schedule_head[0..24]);
+}
+
+test "SubWord through the hardware round is the printed S-box" {
+    // `subWord` relies on `ShiftRows` leaving row 0 alone and on a zero
+    // round key adding nothing, which is true of AES and has to be true of
+    // `std`'s `Block` on every backend it has. Every byte, in every one of
+    // the four positions, against FIPS 197 Figure 7.
+    for (0..256) |v| {
+        const byte: u8 = @intCast(v);
+        const out = subWord(.{ byte, byte ^ 0x5a, ~byte, byte +% 1 });
+        try testing.expectEqual(sbox[byte], out[0]);
+        try testing.expectEqual(sbox[byte ^ 0x5a], out[1]);
+        try testing.expectEqual(sbox[~byte], out[2]);
+        try testing.expectEqual(sbox[byte +% 1], out[3]);
+    }
 }
 
 test "every bit of the key matters, and every bit of the block" {
@@ -336,9 +365,10 @@ test "every bit of the key matters, and every bit of the block" {
 }
 
 test "the S-box is a permutation" {
-    // A transcription error in a 256-entry table is the classic way to get a
-    // cipher that is wrong on some inputs and right on the ones you tested,
-    // and a duplicate entry is what such an error looks like.
+    // The reference table the test above compares against has to be right
+    // itself. A transcription error in a 256-entry table is the classic way
+    // to get a cipher that is wrong on some inputs and right on the ones you
+    // tested, and a duplicate entry is what such an error looks like.
     var seen = [_]bool{false} ** 256;
     for (sbox) |value| {
         try testing.expect(!seen[value]);

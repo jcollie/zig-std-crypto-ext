@@ -83,6 +83,18 @@ Because it is best-effort it is also measured: `zig build timing` runs the
 test from dudect [12] against the release build on the machine at hand, and the
 section on tests below says how to read it.
 
+**AES-192 has exactly the timing `std`'s own AES has.** It is not written
+out in software: the rounds are `std.crypto.core.aes.Block`'s `encrypt` and
+`encryptLast`, which are single instructions on x86-64 with AES-NI and on
+AArch64 with the crypto extension, and the key schedule's S-box goes through
+the same instruction. Only the schedule's bookkeeping is this library's. So it
+is constant-time wherever `std.crypto.core.aes.has_hardware_support` is true
+and falls back to `std`'s software AES wherever it is not — which is decided
+by the CPU the build was given, not the one it runs on, and `-Dcpu=baseline`
+on x86-64 has no AES-NI. An earlier version indexed a 256-byte S-box by the
+state, the cache-timing leak of Bernstein and of Osvik, Shamir and Tromer,
+next door to a DES that goes to some lengths to avoid exactly that.
+
 **The modes' length checks are assertions.** `dst.len >= src.len`, and a whole
 number of blocks for CBC and ECB, are checked in a Debug or ReleaseSafe build
 and not at all in ReleaseFast or ReleaseSmall, where a violation reads past
@@ -114,7 +126,7 @@ gives the numbers and the reasoning.
 | `modes.cbcEncrypt`, `cbcDecrypt` | Cipher Block Chaining. Whole blocks only; choosing a padding is the caller's business, because the padding belongs to whatever specification sent them here. |
 | `modes.cfbEncrypt`, `cfbDecrypt` | Cipher Feedback with full-block feedback — "CFB128" for a 128-bit cipher. A stream mode, so any length, and it runs the cipher *forwards* in both directions, so both take an encryption context. |
 | `modes.ecbEncrypt`, `ecbDecrypt` | Each block alone. Leaks which plaintext blocks are equal; present because key-wrapping constructions and test vectors are stated in terms of it. |
-| `Aes192` | AES-192, the key size `std.crypto` omits — it ships `Aes128` and `Aes256` and nothing between. **Encryption only**, because CFB and CTR never run a cipher backwards; `initDec` is deliberately absent, so asking for it is a compile error rather than a surprise. |
+| `Aes192` | AES-192, the key size `std.crypto` omits — it ships `Aes128` and `Aes256` and nothing between. Built from `std`'s own hardware rounds, so it has `std`'s timing; only the key schedule is written here. **Encryption only**, because CFB and CTR never run a cipher backwards; `initDec` is deliberately absent, so asking for it is a compile error rather than a surprise. |
 | `weak_keys`, `isWeak` | The four keys for which DES is an involution. A password-derived key can be one by accident, and `usmDESPrivProtocol` derives its key from a password. |
 | `hasOddParity`, `setOddParity` | The parity convention DES keys are distributed under. The cipher ignores the parity bits entirely — that is what "56-bit key" means. |
 | `rsa.SecretKey` | An RSA private key, read from PKCS#1 or PKCS#8 DER or from the PEM around either — `fromPem` tells the two apart by looking. Held by value, so the DER it came from can be wiped. |
@@ -202,9 +214,15 @@ signatures are bit-identical to OpenSSL's. Alongside those are the tests that
 a vector cannot reach: that flipping *any single bit* of a signature is
 rejected, which is what catches a comparison that stops early or only compares
 part of the buffer; that truncating the key DER at any offset is an error
-rather than a key missing its tail; and that a key too small, an exponent that
+rather than a key missing its tail; that a key too small, an exponent that
 is even or 1, and a modulus too short for the hash are each refused rather
-than used.
+than used; and that a modulus *too large* is refused too, which matters more
+than it sounds: `std.crypto.ff`'s field is sized in 63-bit limbs and so
+quietly accepts up to 4158 bits, and a key in the gap above 4096 used to parse
+and then index the 512-byte signature buffers past their end. A 4096-bit key,
+the top of the range, is in the suite alongside the 1024- and 2048-bit ones,
+because that is the size at which `fromPem` used to run out of the buffer
+whose size it documents.
 
 The fuzz targets are round-trip properties over the *modes*, where there is
 real room to be wrong — an off-by-one on a final partial block, a chaining
@@ -220,17 +238,17 @@ reach past the first tag. The verifier gets the strong one: every input is a
 forgery, and every one has to be refused.
 
 `zig build timing` measures the constant-time claim instead of trusting it.
-It is the test from dudect [12]: each of the cipher and the key helpers is timed on
-a fixed input and on random ones, hundreds of thousands of times in a random
-order, and Welch's t-test asks whether the two timing distributions can be
-told apart. A |t| above 10 is a leak, and at these sample counts that is a
+It is the test from dudect [12]: DES, Triple DES, AES-192, the key helpers,
+and DES-CBC and AES-192-CFB over a few blocks are each timed on a fixed input
+and on random ones, hundreds of thousands of times in a random order, and
+Welch's t-test asks whether the two timing distributions can be told apart. A |t| above 10 is a leak, and at these sample counts that is a
 difference of about one cycle held consistently. A function whose running time
 *is* its input runs first, and the run fails if that control is not detected,
 so that a clean result means something. It reads the machine it runs on and
 the compiler that built it, which is exactly what the claim depends on and
 exactly what a disassembly read once cannot keep checking. Before the S-boxes
 were rewritten it reported the table lookup as a leak at |t| of 20; it now
-reports every function within 2.
+reports every function within a few units of zero.
 
 ## The API documentation
 

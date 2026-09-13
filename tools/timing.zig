@@ -7,7 +7,10 @@
 //! key and the data, on the assumption that the compiler keeps a mask a mask
 //! and a shift a shift. Nothing forbids a compiler from turning either into a
 //! branch, and a disassembly is the only proof that a particular build did
-//! not -- but a disassembly is read once, and this runs every time:
+//! not -- but a disassembly is read once, and this runs every time. `Aes192`
+//! makes the same claim by a different route, resting on `std`'s hardware
+//! round, and the modes make it by construction, so all of those are on the
+//! list too rather than taken on trust:
 //!
 //! ```console
 //! $ zig build timing
@@ -73,7 +76,11 @@ inline fn cycles() u64 {
 const leak_threshold = 10.0;
 const suspicious_threshold = 4.5;
 
-const Input = struct { key: [8]u8, block: [8]u8 };
+/// Enough key and data for the largest thing measured: Triple DES and AES-192
+/// take 24 bytes of key, and the modes are run over three DES blocks, which
+/// is also one and a half AES blocks -- so the partial-block path of CFB is
+/// on the clock too. Each operation takes the prefix it needs.
+const Input = struct { key: [24]u8, block: [24]u8 };
 
 /// Mean and variance in one pass, Welford's way, so that a million cycle
 /// counts need not be held as floats.
@@ -126,10 +133,12 @@ fn measure(m: Measurement, samples_per_class: usize, random: std.Random, gpa: st
     defer gpa.free(classes);
     const inputs = try gpa.alloc(Input, total);
     defer gpa.free(inputs);
-    for (classes, inputs) |*class, *input| {
-        class.* = random.boolean();
-        m.prepare(class.*, random, input);
-    }
+    // Exactly half in each class, in a random order -- rather than a coin
+    // per sample, which gives the same thing on average and leaves the
+    // percentile arithmetic below assuming neither class came up empty.
+    for (classes, 0..) |*class, i| class.* = i % 2 == 1;
+    random.shuffle(bool, classes);
+    for (classes, inputs) |class, *input| m.prepare(class, random, input);
 
     var t0 = try std.ArrayList(u64).initCapacity(gpa, total);
     defer t0.deinit(gpa);
@@ -191,8 +200,9 @@ fn zerosOrRandom(class: bool, random: std.Random, input: *Input) void {
 fn weakOrRandom(class: bool, random: std.Random, input: *Input) void {
     // Fixed: a weak key, which a comparison that stops early matches in full
     // on its first candidate. Random: a key that matches none of them.
-    input.* = .{ .key = des.weak_keys[0], .block = @splat(0) };
-    if (class) random.bytes(&input.key);
+    input.* = .{ .key = @splat(0), .block = @splat(0) };
+    input.key[0..8].* = des.weak_keys[0];
+    if (class) random.bytes(input.key[0..8]);
 }
 
 // -- the operations ---------------------------------------------------------
@@ -200,7 +210,7 @@ fn weakOrRandom(class: bool, random: std.Random, input: *Input) void {
 fn encryptOp(input: *const Input) u64 {
     var out: [8]u8 = undefined;
     const start = cycles();
-    des.Des.initEnc(input.key).encrypt(&out, &input.block);
+    des.Des.initEnc(input.key[0..8].*).encrypt(&out, input.block[0..8]);
     const end = cycles();
     std.mem.doNotOptimizeAway(out);
     return end - start;
@@ -209,7 +219,47 @@ fn encryptOp(input: *const Input) u64 {
 fn decryptOp(input: *const Input) u64 {
     var out: [8]u8 = undefined;
     const start = cycles();
-    des.Des.initDec(input.key).decrypt(&out, &input.block);
+    des.Des.initDec(input.key[0..8].*).decrypt(&out, input.block[0..8]);
+    const end = cycles();
+    std.mem.doNotOptimizeAway(out);
+    return end - start;
+}
+
+fn des3EncryptOp(input: *const Input) u64 {
+    var out: [8]u8 = undefined;
+    const start = cycles();
+    des.Des3.initEnc(input.key).encrypt(&out, input.block[0..8]);
+    const end = cycles();
+    std.mem.doNotOptimizeAway(out);
+    return end - start;
+}
+
+fn aes192EncryptOp(input: *const Input) u64 {
+    var out: [16]u8 = undefined;
+    const start = cycles();
+    des.Aes192.initEnc(input.key).encrypt(&out, input.block[0..16]);
+    const end = cycles();
+    std.mem.doNotOptimizeAway(out);
+    return end - start;
+}
+
+/// DES-CBC over three blocks: the mode's own loop and XORs on top of the
+/// cipher, which is what SNMPv3 privacy actually runs.
+fn cbcOp(input: *const Input) u64 {
+    var out: [24]u8 = undefined;
+    const start = cycles();
+    des.modes.cbcEncrypt(des.Des.EncryptCtx, des.Des.initEnc(input.key[0..8].*), &out, &input.block, @splat(0));
+    const end = cycles();
+    std.mem.doNotOptimizeAway(out);
+    return end - start;
+}
+
+/// AES-192-CFB over twenty-four bytes: one whole block and a partial one,
+/// so the final-block path is timed along with the rest.
+fn cfbOp(input: *const Input) u64 {
+    var out: [24]u8 = undefined;
+    const start = cycles();
+    des.modes.cfbEncrypt(des.Aes192.EncryptCtx, des.Aes192.initEnc(input.key), &out, &input.block, @splat(0));
     const end = cycles();
     std.mem.doNotOptimizeAway(out);
     return end - start;
@@ -217,14 +267,14 @@ fn decryptOp(input: *const Input) u64 {
 
 fn isWeakOp(input: *const Input) u64 {
     const start = cycles();
-    const weak = des.isWeak(input.key);
+    const weak = des.isWeak(input.key[0..8].*);
     const end = cycles();
     std.mem.doNotOptimizeAway(weak);
     return end - start;
 }
 
 fn parityOp(input: *const Input) u64 {
-    var key = input.key;
+    var key = input.key[0..8].*;
     const start = cycles();
     des.setOddParity(&key);
     const odd = des.hasOddParity(&key);
@@ -250,6 +300,10 @@ const measurements = [_]Measurement{
     .{ .name = "loop bound from data (control)", .prepare = zerosOrRandom, .op = leakyOp, .must_leak = true },
     .{ .name = "Des encrypt", .prepare = zerosOrRandom, .op = encryptOp },
     .{ .name = "Des decrypt", .prepare = zerosOrRandom, .op = decryptOp },
+    .{ .name = "Des3 encrypt", .prepare = zerosOrRandom, .op = des3EncryptOp },
+    .{ .name = "Aes192 encrypt", .prepare = zerosOrRandom, .op = aes192EncryptOp },
+    .{ .name = "DES-CBC, three blocks", .prepare = zerosOrRandom, .op = cbcOp },
+    .{ .name = "AES-192-CFB, 24 bytes", .prepare = zerosOrRandom, .op = cfbOp },
     .{ .name = "isWeak", .prepare = weakOrRandom, .op = isWeakOp },
     .{ .name = "setOddParity + hasOddParity", .prepare = zerosOrRandom, .op = parityOp },
 };

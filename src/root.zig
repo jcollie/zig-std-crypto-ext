@@ -54,8 +54,10 @@
 //! authenticate nothing. Everything here is for talking to something that
 //! already exists. What it does promise is spelled out in the same two
 //! places: the cipher is constant-time in the key and the data, on the
-//! assumptions `Des` names, and the modes' length checks are assertions,
-//! which `modes` says the consequences of.
+//! assumptions `Des` names -- and `Aes192`, built on `std`'s hardware
+//! rounds, has whatever timing `std`'s own AES has on the same build -- and
+//! the modes' length checks are assertions, which `modes` says the
+//! consequences of.
 
 const std = @import("std");
 const testing = std.testing;

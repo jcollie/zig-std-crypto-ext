@@ -73,27 +73,45 @@ fn nowMs(io: std.Io) i64 {
 }
 
 /// What the watchdog needs to see, written before each iteration begins.
+///
+/// Everything but `timeout_s` and `dir`, which are set once before the
+/// watchdog exists, is shared between the loop and the watchdog under
+/// `mutex`. The loop takes it for the few nanoseconds it spends copying the
+/// next input in; the watchdog takes it for the whole of writing a report,
+/// so that the report is of one input and not of the tail of one and the
+/// head of the next. Neither ever holds it while a target is running.
 const Watch = struct {
+    mutex: std.Io.Mutex = .init,
     /// When the running iteration started, or zero between iterations.
-    started_ms: std.atomic.Value(i64) = .init(0),
+    started_ms: i64 = 0,
     /// A copy of the input it is running, which is what a hang has to
     /// report. A copy rather than a slice of the loop's buffer, so that the
-    /// watchdog never reads memory the main thread may be reallocating: the
-    /// two can still race over these bytes if an iteration ends in the same
-    /// instant it is declared hung, and then the report is garbled rather
-    /// than the read being of freed memory.
+    /// watchdog never reads memory the main thread may be reallocating.
     input_buffer: [4096]u8 = undefined,
     input_len: usize = 0,
     target: []const u8 = "",
     timeout_s: u32 = 10,
     dir: []const u8 = "",
 
-    fn setInput(w: *Watch, bytes: []const u8) void {
+    /// The loop is about to run `bytes` against `target`.
+    fn begin(w: *Watch, io: std.Io, target: []const u8, bytes: []const u8) void {
+        w.mutex.lockUncancelable(io);
+        defer w.mutex.unlock(io);
         const n = @min(bytes.len, w.input_buffer.len);
         @memcpy(w.input_buffer[0..n], bytes[0..n]);
         w.input_len = n;
+        w.target = target;
+        w.started_ms = nowMs(io);
     }
 
+    /// The iteration came back.
+    fn end(w: *Watch, io: std.Io) void {
+        w.mutex.lockUncancelable(io);
+        defer w.mutex.unlock(io);
+        w.started_ms = 0;
+    }
+
+    /// Only under the lock.
     fn input(w: *const Watch) []const u8 {
         return w.input_buffer[0..w.input_len];
     }
@@ -169,9 +187,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("no target called {s}; there are: {s}\n", .{ name, targetNames() });
             std.process.exit(2);
         };
-        watch.setInput(bytes);
-        watch.target = target.name;
-        watch.started_ms.store(nowMs(io), .release);
+        watch.begin(io, target.name, bytes);
         target.run(bytes) catch |err| {
             std.debug.print("{s}: {t}\n", .{ target.name, err });
             show(bytes);
@@ -195,11 +211,9 @@ pub fn main(init: std.process.Init) !void {
         const deadline = nowMs(io) + @as(i64, seconds) * 1000;
         while (if (iterations) |n| runs < n else nowMs(io) < deadline) : (runs += 1) {
             try makeInput(gpa, &buffer, random, target);
-            watch.setInput(buffer.items);
-            watch.target = target.name;
-            watch.started_ms.store(nowMs(io), .release);
+            watch.begin(io, target.name, buffer.items);
             const result = target.run(buffer.items);
-            watch.started_ms.store(0, .release);
+            watch.end(io);
             if (checked.detectLeaks() != 0) {
                 std.debug.print("\n{s}: leaked\n", .{target.name});
                 try report(io, dir, target.name, buffer.items);
@@ -379,10 +393,22 @@ fn show(input: []const u8) void {
 fn watchdog(io: std.Io) void {
     while (true) {
         std.Io.sleep(io, .fromMilliseconds(500), .awake) catch return;
-        const started = watch.started_ms.load(.acquire);
-        if (started == 0) continue;
+        // Held from here to the exit, so that what is reported is the input
+        // that was running when the decision was made and the loop cannot
+        // swap in the next one under the report. The loop only ever wants
+        // the lock between iterations, and a hang means there is no next
+        // iteration coming.
+        watch.mutex.lockUncancelable(io);
+        const started = watch.started_ms;
+        if (started == 0) {
+            watch.mutex.unlock(io);
+            continue;
+        }
         const elapsed = nowMs(io) - started;
-        if (elapsed < @as(i64, watch.timeout_s) * 1000) continue;
+        if (elapsed < @as(i64, watch.timeout_s) * 1000) {
+            watch.mutex.unlock(io);
+            continue;
+        }
 
         std.debug.print(
             "\n{s}: no answer after {d} seconds, which is a hang\n",

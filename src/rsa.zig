@@ -108,7 +108,14 @@ const Fe = Modulus.Fe;
 /// two reduced exponents and a coefficient: five halves and two wholes of the
 /// modulus, so about four times the modulus, plus tags and lengths. PKCS#8
 /// wraps that in about another 40 bytes. Doubling the modulus length five
-/// times over is comfortably clear of both.
+/// times over is comfortably clear of both: a 4096-bit PKCS#8 key is 2373
+/// bytes of DER against the 2816 here.
+///
+/// It is sized for the DER and only the DER. `fromPem` decodes the base64
+/// straight out of the PEM text into this buffer, so the buffer never has
+/// to hold the base64 as well -- which is a third longer, and was how an
+/// earlier version of `pemDecode` turned a 4096-bit key into
+/// `error.BufferTooSmall` with a buffer of exactly this size.
 pub const max_secret_key_der = 5 * max_modulus_len + 256;
 
 /// What can go wrong reading a key out of bytes somebody else wrote.
@@ -254,7 +261,12 @@ pub const PublicKey = struct {
     /// way round; this is the one place the two deliberately differ.)
     pub fn fromBytes(modulus: []const u8, exponent: []const u8) ParseError!PublicKey {
         const n = Modulus.fromBytes(modulus, .big) catch return error.InvalidKey;
-        if (n.bits() < min_modulus_bits) return error.InvalidKey;
+        // Both bounds, and the upper one is not decoration. The field type
+        // is sized in 63-bit limbs, so `Modulus.fromBytes` accepts up to 4158
+        // bits without complaint, and everything downstream slices arrays of
+        // `max_modulus_len` bytes by `modulusLength()`. A modulus between the
+        // two ceilings would pass here and walk off the end of those.
+        if (n.bits() < min_modulus_bits or n.bits() > max_modulus_bits) return error.InvalidKey;
 
         // An exponent above 2^32 is refused for the same reason `std` refuses
         // it: no real key has one, Windows' CryptoAPI cannot represent one,
@@ -338,6 +350,13 @@ pub const PublicKey = struct {
 /// Held by value, with the components copied in rather than pointed at, so
 /// that the DER it was parsed from can be overwritten -- which a caller
 /// holding a private key ought to be doing -- without invalidating the key.
+/// It has no `deinit`, for the same reason `Des`'s contexts have none: there
+/// is nothing to free. A caller who wants the private exponent gone when
+/// finished zeroes the whole value, which is plain bytes and nothing else:
+///
+/// ```zig
+/// defer std.crypto.secureZero(u8, std.mem.asBytes(&secret_key));
+/// ```
 ///
 /// The Chinese Remainder Theorem parameters are deliberately not kept: this
 /// implementation does not use them, and a secret not stored is a secret not
@@ -373,6 +392,10 @@ pub const SecretKey = struct {
         // prime1, prime2, exponent1, exponent2, coefficient. Read and dropped:
         // a truncated key should fail here rather than be used as if whole.
         for (0..5) |_| _ = try seq.takeInteger();
+        // And nothing after them. A version-0 key has exactly nine fields,
+        // so anything more is either a multi-prime key that lied about its
+        // version or bytes that are not part of the key at all.
+        if (!seq.atEnd() or !outer.atEnd()) return error.MalformedDer;
 
         return fromComponents(modulus, public_exponent, private_exponent);
     }
@@ -389,6 +412,10 @@ pub const SecretKey = struct {
 
         try seq.takeRsaAlgorithmIdentifier();
         const inner = try seq.take(tag_octet_string);
+        // The `PrivateKeyInfo` may go on -- optional attributes, and in
+        // version 1 the public key -- so the inner sequence is not required
+        // to end here. The outer one is: bytes after it belong to nothing.
+        if (!outer.atEnd()) return error.MalformedDer;
         return fromPkcs1Der(inner);
     }
 
@@ -472,34 +499,30 @@ fn pemDecode(out: []u8, text: []const u8, labels: []const []const u8) PemError![
     const body_start = label_end + marker_suffix.len;
     const end = std.mem.indexOfPos(u8, text, body_start, end_prefix) orelse
         return error.MalformedPem;
-    // The END marker has to name the same thing the BEGIN marker did,
-    // otherwise this is two overlapping blocks rather than one.
-    const end_label_start = end + end_prefix.len;
-    if (end_label_start + label.len > text.len) return error.MalformedPem;
-    if (!std.mem.eql(u8, text[end_label_start..][0..label.len], label)) return error.MalformedPem;
-
-    // The base64 is wrapped at 64 columns, so the line endings have to come
-    // out before it is decoded -- and they may be CRLF, since a key is as
-    // likely to have come through a mail message as off a disk.
-    var packed_len: usize = 0;
-    for (text[body_start..end]) |c| {
-        switch (c) {
-            ' ', '\t', '\r', '\n' => {},
-            else => {
-                if (packed_len >= out.len) return error.BufferTooSmall;
-                out[packed_len] = c;
-                packed_len += 1;
-            },
-        }
+    // The END marker has to name the same thing the BEGIN marker did, and
+    // then close, otherwise this is two overlapping blocks rather than one --
+    // or a line that merely begins the way an END line does.
+    const end_marker = end + end_prefix.len;
+    if (end_marker + label.len + marker_suffix.len > text.len) return error.MalformedPem;
+    if (!std.mem.eql(u8, text[end_marker..][0..label.len], label)) return error.MalformedPem;
+    if (!std.mem.eql(u8, text[end_marker + label.len ..][0..marker_suffix.len], marker_suffix)) {
+        return error.MalformedPem;
     }
 
-    const decoder = std.base64.standard.Decoder;
-    const der_len = decoder.calcSizeForSlice(out[0..packed_len]) catch return error.InvalidBase64;
-    if (der_len > out.len) return error.BufferTooSmall;
-    // Decoding in place: the DER is three quarters the length of the base64
-    // it came from, and the decoder reads each quantum before it writes one,
-    // so the output never overtakes the input.
-    decoder.decode(out[0..der_len], out[0..packed_len]) catch return error.InvalidBase64;
+    // The base64 is wrapped at 64 columns and the line endings may be CRLF,
+    // since a key is as likely to have come through a mail message as off a
+    // disk. The decoder is told to step over both rather than the text being
+    // repacked first, and that is not a shortcut: repacking the base64 into
+    // `out` before decoding it there means `out` has to hold the base64, a
+    // third longer than the DER, and a buffer sized for the DER -- which is
+    // what `max_secret_key_der` promises to be -- is then too small for a
+    // 4096-bit key. Decoding straight from the text also means nothing is
+    // ever decoded over itself.
+    const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    const der_len = decoder.decode(out, text[body_start..end]) catch |err| switch (err) {
+        error.NoSpaceLeft => return error.BufferTooSmall,
+        error.InvalidCharacter, error.InvalidPadding => return error.InvalidBase64,
+    };
     return out[0..der_len];
 }
 
@@ -618,6 +641,17 @@ pub const pkcs1v1_5 = struct {
                 // and the exponentiation walks every bit it is given: at the
                 // full 4096-bit width a 2048-bit key would pay for 2048
                 // leading zero bits it does not have.
+                //
+                // Exactly `k`, and not any shorter. `std.crypto.ff` decides
+                // between its constant-time table walk and a short-exponent
+                // loop with a data-dependent branch by looking at the
+                // exponent's *length*, and a precedence slip in that test
+                // (0.16.0: `public and len < 3 or (len == 3 and ...)`) sends
+                // a three-byte exponent with a small top nibble down the
+                // branchy path even when it is marked secret. `k` is at
+                // least 64 here, which is what keeps this out of reach; an
+                // optimisation that serialised `d` at its minimal length
+                // would not have that guarantee.
                 var d_bytes: [max_modulus_len]u8 = undefined;
                 defer crypto.secureZero(u8, d_bytes[0..k]);
                 secret_key.d.toBytes(d_bytes[0..k], .big) catch unreachable;
@@ -824,6 +858,99 @@ const key_1024_pkcs1 =
     "KNK1+hj8aFNJvktVIaECQDpYTrHjh7Cfxwk1AR4osOJdf59ecna2Fiegsn6zULpd\n" ++
     "MVBCd5Jdjlwloxksy/1nCUvQLE+ObMYui0GltsfC0Yc=\n" ++
     "-----END RSA PRIVATE KEY-----\n";
+
+/// A 4096-bit key, the largest this module accepts, as PKCS#8. It is here
+/// because the top of the range is where the fixed-size buffers are fullest:
+/// this is the key that found `fromPem` unable to fit into the buffer whose
+/// size it documents.
+const key_4096_pkcs8 =
+    "-----BEGIN PRIVATE KEY-----\n" ++
+    "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\n" ++
+    "cQ/JnoXxkeTHe9m+dkC3U+MxHm7Y\n" ++
+    "-----END PRIVATE KEY-----\n";
+
+/// Its public half.
+const pub_4096_spki =
+    "-----BEGIN PUBLIC KEY-----\n" ++
+    "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAl3ozTENLJi0Xo22fLnWd\n" ++
+    "C4ZH1EqW43L4xA6MafTTkWeTLupUd9OmFelkjUyXcl/fNv+Bp0KLJpAN/jdfDzPB\n" ++
+    "8DHhNGZf7HnAO7jWXSlNWweZWoxUlEi6nldHjpAxr53jTx1ealyjTXiaJQWllp3n\n" ++
+    "RY1w6es8Mqlv3ZpVzbicomKWQkZgfCHwnE/KHiRJoD10oAwHBo42ITTse37Qw+6k\n" ++
+    "5soRyZWc7JvpQoHp4sDtwd8vSxTONQjggnW0rJaS/RN/ZPYF0JOUS1t1A5sKNq2T\n" ++
+    "aA2y0o2Ats+7PsF2bFkLF8+n9y7k1TGDi2SHzrZ8S4F8fEJQTeFvsnYJqYUTdqij\n" ++
+    "BTMU64Eqg1L3m+e96eSLnafs9UhcCR4xQUeLOzyKIj2DE42yc5RVzJF2wM23RjjQ\n" ++
+    "Op2JJODa9y02qvETslWpeBkVXXM/1BETKFM1sBfe69/NypQFlW7V4fs3fkRgffMV\n" ++
+    "LB3fhK8fxBiIe4d85MJwS8myK39aOAoWolHUip6CxUn0LlFwekcS4CRYlbTrGpcj\n" ++
+    "dbRSSeAuq+DKSYDmxr28dt8TAnIfJkzfiEed69t1VjbVPCryM0jju4NFPnFspilU\n" ++
+    "DP789ofzQ3ACc5UzTdt9tVzn48yekRX3NwmUgEG/Fkj3vq3n7EhSDuCWHNKWQz0E\n" ++
+    "Tp6AYp67uknnJuFYw5ktqykCAwEAAQ==\n" ++
+    "-----END PUBLIC KEY-----\n";
+
+/// `openssl dgst -sha256 -sign key4096 msg.txt`, OpenSSL 3.6.3.
+const sig_4096_sha256_hex = "361d413e3380b4bbdacd47eb706d29eea7b034c45e44b7f594378ab8ad2ec5fc" ++
+    "c00bebe74c533b53edf68ec08fecafdcc2a61bcb9671f9567221ec1922b53ec8" ++
+    "e0c1cc23e8225c048cc93327a62c989a204ac365a8fb9bf3415db4017426d68c" ++
+    "c87c0cc94fd6957bee0e43a3ba8584d6ad6e0e2c7c0146d7f9919a4bd1a4e186" ++
+    "d8a8d36efd496c60c2e888ecf272fc23c839bc30fd8fdf995ca945685b5b1ad5" ++
+    "c24e1736fb17fa9048d5896c3329a41b8c13793057c8f1aa32b2698f3f128984" ++
+    "50d7a87c81bba26149a1230a1c7f85f34818b5c215e2f895f522ec943cf9d650" ++
+    "1ace666347477fe10fab912d1621a2a581ecb543b6dde304391b8596ec5d74d2" ++
+    "c5b683659914685d42f3f8f39876bcc7034de880cd2c959e542637a6bf6fa7f2" ++
+    "4b7a0aa76c977aa4f6149af4c4d0cb279ae495c990f27251ce6556444350aa76" ++
+    "1f676cb520bc14427113aca54c8db0ebb78831fd379d32d6332a3fa228a4f9ca" ++
+    "24c8bb1deb46220d15560a43eef3fb0aa722d09daa94265ac6d55a226e00371d" ++
+    "8c07c700cc1da96f582190eab1be2a48b7d04606affa9fbf2ae8fc70c5de38a1" ++
+    "49a0d5cf938827d07e03ada43550b1288e2358627055431143257a585378dc53" ++
+    "6dc416647085551cf3a9492f4de8f0cf62a099a4e91adb00ef16ef4d474d3302" ++
+    "0851baea21864a8b04283dce2db071c491c345cea950afe8422009da6c6ad4ad";
 
 /// `openssl dgst -sha256 -sign key2048 msg.txt`.
 const sig_2048_sha256_hex = "90c564cf0c0ff9d16bfe0ecd2630ea62a7c82d18b30f9f598a4f5896c567c7ab" ++
@@ -1162,4 +1289,102 @@ test "PEM with CRLF line endings, and with noise above the block" {
     var der: [max_secret_key_der]u8 = undefined;
     const sk = try SecretKey.fromPem(&der, crlf_buf[0..len]);
     try testing.expectEqual(@as(usize, 2048), sk.n.bits());
+}
+
+test "a 4096-bit key fits the buffer whose size it documents" {
+    // The top of the accepted range, through `fromPem` into a buffer of
+    // exactly `max_secret_key_der`. This is the case that used to fail: the
+    // base64 was repacked into the same buffer before being decoded, and
+    // base64 is a third longer than the DER the buffer is sized for.
+    var der: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der, key_4096_pkcs8);
+    try testing.expectEqual(@as(usize, 4096), sk.n.bits());
+    try testing.expectEqual(@as(usize, max_modulus_len), sk.modulusLength());
+
+    var pub_der: [max_secret_key_der]u8 = undefined;
+    const pk = try PublicKey.fromPem(&pub_der, pub_4096_spki);
+
+    // And the signature is what OpenSSL makes with it, byte for byte, and
+    // fills the whole of a `max_modulus_len` buffer with nothing over.
+    var expected_buf: [max_modulus_len]u8 = undefined;
+    const expected = unhex(&expected_buf, sig_4096_sha256_hex);
+    var sig_buf: [max_modulus_len]u8 = undefined;
+    const sig = try pkcs1v1_5.Signer(Sha256).sign(&sig_buf, test_message, sk);
+    try testing.expectEqualSlices(u8, expected, sig);
+    try pkcs1v1_5.Signer(Sha256).verify(sig, test_message, pk);
+}
+
+/// A PKCS#1 `RSAPublicKey` with a modulus of `modulus_len` bytes, top bit
+/// set and odd, and e = 65537: well-formed DER for a key of any size.
+fn publicKeyDerOfSize(out: []u8, modulus_len: usize) []u8 {
+    var w: std.Io.Writer = .fixed(out);
+    const n_len = modulus_len + 1; // a sign byte, since the top bit is set
+    const e = [_]u8{ 0x02, 0x03, 0x01, 0x00, 0x01 };
+    const body_len = 4 + n_len + e.len;
+    w.writeAll(&.{ 0x30, 0x82, @intCast(body_len >> 8), @intCast(body_len & 0xff) }) catch unreachable;
+    w.writeAll(&.{ 0x02, 0x82, @intCast(n_len >> 8), @intCast(n_len & 0xff), 0x00 }) catch unreachable;
+    w.writeByte(0xc0) catch unreachable;
+    for (1..modulus_len - 1) |_| w.writeByte(0x11) catch unreachable;
+    w.writeByte(0x01) catch unreachable;
+    w.writeAll(&e) catch unreachable;
+    return w.buffered();
+}
+
+test "a modulus above the ceiling is refused, not sliced past the buffers" {
+    // `std.crypto.ff` sizes its field in 63-bit limbs, so a
+    // `Modulus(4096)` quietly accepts anything up to 4158 bits. A key in
+    // that gap used to parse, report a `modulusLength()` of 513 or more,
+    // and then index `[max_modulus_len]u8` arrays with it -- a panic in a
+    // safe build and a stack overrun in a fast one, reachable from any
+    // public key an attacker hands to `verify`.
+    var buf: [1024]u8 = undefined;
+    for ([_]usize{ 513, 514, 519 }) |modulus_len| {
+        const der = publicKeyDerOfSize(&buf, modulus_len);
+        try testing.expectError(error.InvalidKey, PublicKey.fromDer(der));
+    }
+    // The ceiling itself is fine, and is exactly the buffer.
+    const at_limit = try PublicKey.fromDer(publicKeyDerOfSize(&buf, 512));
+    try testing.expectEqual(@as(usize, max_modulus_len), at_limit.modulusLength());
+}
+
+test "bytes after the key are rejected, for secret keys as for public" {
+    // `PublicKey.fromPkcs1Der` always checked that the DER ended where the
+    // key did; the secret key readers did not, so a key with anything
+    // appended -- inside the sequence or after it -- was accepted. A strict
+    // reader is strict about both.
+    var full: [max_secret_key_der + 8]u8 = undefined;
+    const der = try pemDecode(&full, key_2048_pkcs8, &.{"PRIVATE KEY"});
+    _ = try SecretKey.fromDer(der);
+
+    // After the outer sequence, for both shapes of key.
+    @memcpy(full[der.len..][0..4], "JUNK");
+    try testing.expectError(error.MalformedDer, SecretKey.fromDer(full[0 .. der.len + 4]));
+
+    var pkcs1: [max_secret_key_der + 8]u8 = undefined;
+    const der1 = try pemDecode(&pkcs1, key_2048_pkcs1, &.{"RSA PRIVATE KEY"});
+    _ = try SecretKey.fromDer(der1);
+    @memcpy(pkcs1[der1.len..][0..4], "JUNK");
+    try testing.expectError(error.MalformedDer, SecretKey.fromDer(pkcs1[0 .. der1.len + 4]));
+
+    // And inside the PKCS#1 sequence, after the coefficient: a tenth
+    // INTEGER, with the lengths above it adjusted to cover it. Both are
+    // long-form lengths of two bytes, at offsets 2 and 3 of the sequence.
+    var grown: [max_secret_key_der + 8]u8 = undefined;
+    @memcpy(grown[0..der1.len], der1);
+    grown[der1.len..][0..3].* = .{ 0x02, 0x01, 0x07 };
+    const inner_len = std.mem.readInt(u16, der1[2..4], .big) + 3;
+    std.mem.writeInt(u16, grown[2..4], inner_len, .big);
+    try testing.expectError(error.MalformedDer, SecretKey.fromDer(grown[0 .. der1.len + 3]));
+}
+
+test "an END line has to close" {
+    // The label was compared and the dashes after it were not, so a line
+    // that merely began the way an END line does was taken for one.
+    var der: [max_secret_key_der]u8 = undefined;
+    try testing.expectError(error.MalformedPem, SecretKey.fromPem(&der,
+        \\-----BEGIN PRIVATE KEY-----
+        \\MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu
+        \\-----END PRIVATE KEY
+        \\
+    ));
 }
