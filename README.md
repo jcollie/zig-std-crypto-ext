@@ -24,12 +24,19 @@ $ nix develop -c zig build test
 
 ## Where this lives
 
-Two homes, with the same history in both.
+Three homes, with the same history in each.
 
 * Forgejo, at <https://git.jcollie.dev/jeff/zig-std-crypto-ext>, which is where the
   workflow runs and where the documentation is published from.
 * [Tangled](https://tangled.org/), at
   <https://tangled.org/jcollie.dev/zig-std-crypto-ext>.
+* [Radicle](https://radicle.xyz/), as `rad:z2UqY7wXCc4xUHRfeaDepK33Kch1Z`. A
+  Radicle repository is only findable by its ID, so that string is the whole
+  address:
+
+  ```console
+  $ rad clone rad:z2UqY7wXCc4xUHRfeaDepK33Kch1Z
+  ```
 
 ## Why this exists
 
