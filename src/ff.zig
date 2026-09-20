@@ -34,13 +34,10 @@
 //!
 //! `zig build timing` measures it rather than asserting it, by the dudect
 //! method the rest of that harness uses. Welch's t between a fixed and a
-//! random three-byte secret exponent is about **2400** before this change.
-//! After it, single digits -- 9.7 at 175,000 samples and 5.9 at 400,000,
-//! which is the harness's "suspicious" band rather than its "leak" band
-//! (ten), and falling as samples rise, which is what a constant-time
-//! function does and a leaking one does not. The means move from 530,000
-//! cycles against 710,000 -- the two classes plainly doing different amounts
-//! of work -- to the same number either way.
+//! random three-byte secret exponent is about **2400** before this change
+//! and **about 1** after, with the means going from 530,000 cycles against
+//! 710,000 -- the two classes plainly doing different amounts of work -- to
+//! the same number either way.
 //!
 //! Whether it is reachable depends on the caller: an RSA key whose private
 //! exponent is three bytes is broken for other reasons, but `ff` is general,

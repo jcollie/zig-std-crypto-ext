@@ -326,6 +326,15 @@ const exponent_modulus: [256]u8 = blk: {
 
 fn shortExponent(class: bool, random: std.Random, input: *Input) void {
     input.* = .{ .key = @splat(0), .block = @splat(0x42) };
+    // The fixed class is an ordinary three-byte exponent and not zeros.
+    // Zeros would make it the exponent 1, which is not a representative
+    // value but a degenerate one: nearly every step of the ladder would be
+    // multiplying by one, and a test whose two classes differ in *that* is
+    // measuring the difference between a normal exponentiation and a trivial
+    // one rather than between two secrets. Written down because the first
+    // version of this did exactly that, and reported a leak at a million and
+    // a half samples which was its own doing.
+    input.key[0..3].* = .{ 0x0b, 0x9d, 0x37 };
     if (class) random.bytes(input.key[0..3]);
     // Both classes keep the top nibble small, which is the condition that
     // sends a three-byte exponent down the short path: the classes must

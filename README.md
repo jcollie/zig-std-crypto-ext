@@ -164,14 +164,19 @@ random three-byte secret exponent:
 | | t |
 | --- | --- |
 | upstream | ~2400 |
-| here, 175k samples | 9.7 |
-| here, 400k samples | 5.9 |
+| here | ~1 |
 
-Ten is the threshold at which the harness calls a leak, and 4.5 the one above
-which it asks for more samples. Falling as the sample count rises is what a
-constant-time function does and a leaking one does not. The means go from
+Ten is the threshold at which the harness calls a leak. The means go from
 530,000 cycles against 710,000 — the classes plainly doing different amounts
-of work — to the same number either way. Whether it is reachable depends on
+of work — to the same number either way.
+
+The fixed class in that measurement is an ordinary three-byte exponent rather
+than zeros, and that is not a detail. Zeros make it the exponent 1, which is
+degenerate: nearly every step of the ladder is then multiplying by one, and
+the test ends up comparing a trivial exponentiation with a normal one rather
+than one secret with another. Written that way it reports single digits at a
+hundred thousand samples and a leak at a million and a half, which is the
+test's doing and not the code's. Whether it is reachable depends on
 the caller: an RSA key with a three-byte private exponent is broken for other
 reasons, but `ff` is general, and a protocol using short secret exponents on
 purpose would leak them.
