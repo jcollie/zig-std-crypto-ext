@@ -140,6 +140,47 @@ gives the numbers and the reasoning.
 | `rsa.SecretKey` | An RSA private key, read from PKCS#1 or PKCS#8 DER or from the PEM around either — `fromPem` tells the two apart by looking. Held by value, so the DER it came from can be wiped. |
 | `rsa.PublicKey` | An RSA public key, from a `SubjectPublicKeyInfo` or a bare PKCS#1 `RSAPublicKey`, DER or PEM. Both shapes are accepted because formats that carry one are inconsistent about which they mean. |
 | `rsa.pkcs1v1_5.Signer(Hash)` | RFC 8017 RSASSA-PKCS1-v1_5, over SHA-1, SHA-224, SHA-256, SHA-384 or SHA-512. `sign`/`verify` over a message, `signConcat`/`verifyConcat` over its pieces, and `signDigest`/`verifyDigest` for a protocol that hashes something which never exists as contiguous bytes. |
+| `ff` | `std.crypto.ff` with one function put right — the only thing here that corrects the standard library rather than adding to it. See below. |
+
+### The one carried patch
+
+`ff` is not an addition. It is `std.crypto.ff` vendored from Zig 0.16.0 with a
+single function changed, and the intent is that the change goes upstream and
+the file then goes away.
+
+`Modulus.pow` serializes the secret exponent before handing it to the
+exponentiation ladder, and it sized that buffer by `Fe.encoded_bytes` — the
+*type's* maximum width — rather than by the modulus's own. The ladder spends
+four squarings on every nibble it is given, so the difference between the two
+is squarings of leading zeros, and the cost is linear in how far the type
+overshoots the key. An RSA implementation that supports 4096-bit keys
+instantiates `Modulus(4096)` for all of them, so every 2048-bit key paid
+twice. One private exponentiation, ReleaseFast:
+
+| | `std.crypto.ff` | `ff` here |
+| --- | --- | --- |
+| `Modulus(4096)`, 2048-bit modulus | 26.1 ms | 13.1 ms |
+| `Modulus(2048)`, 2048-bit modulus | 12.8 ms | 12.8 ms |
+| `Modulus(1024)`, 1024-bit modulus | 1.8 ms | 1.8 ms |
+
+Constant time is unaffected: the new length depends on the modulus, which is
+public, and not on the exponent, which is not. `powPublic` beside it already
+trims this way and goes further, stripping leading zero *bits* — which the
+secret path must not do, because that length would depend on the secret.
+
+`rsa` here does not benefit, because it never calls `pow`: it serializes the
+exponent to exactly the modulus length itself and calls
+`powWithEncodedExponent`, which was the right thing to do and is the reason
+the bug was invisible from inside this library. What found it was a TLS
+implementation elsewhere that does call `pow`, and spends 26 ms of a
+handshake on it.
+
+`tests/ff.zig` is differential rather than exemplary: the same exponentiations
+through both implementations, at the widths where the patch changes the work
+and at the widths where it must not. The second set is not ceremony — sizing
+the exponent by the limb count rather than the bit length asks for more bytes
+than the buffer has when the modulus fills the type, and that is how the first
+version of the patch was caught.
 
 ## Using it
 

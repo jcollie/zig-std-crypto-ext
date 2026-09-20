@@ -28,6 +28,19 @@ pub fn build(b: *std.Build) void {
 
     // The fuzz targets: what the ciphers and modes must do with keys and data
     // nobody chose.
+    // `src/ff.zig` is a carried patch of a standard library file, so what it
+    // owes is agreement with the thing it replaces. Its own module, because
+    // it imports both this library and `std.crypto.ff` and compares them.
+    const ff_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ff.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "std_crypto_ext", .module = mod }},
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(ff_tests).step);
+
     // They are ordinary tests as well as fuzz tests, so `zig build test`
     // exercises the same properties on the seeds checked in beside them.
     const fuzz_mod = b.createModule(.{
