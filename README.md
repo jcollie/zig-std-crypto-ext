@@ -112,18 +112,28 @@ modes behave too. The doc comment on `modes` spells out the rest: `dst` is the
 same slice as `src` or does not overlap it, and the mode's temporaries are
 zeroed on return while the contexts, being the caller's, are not.
 
-**RSA's private exponentiation is constant-time, and it is neither blinded nor
-CRT.** The exponentiation goes through `std.crypto.ff`, the same Montgomery
-arithmetic `std` verifies certificates with, which is constant time in both
-the base and the exponent — the defence that matters against a remote timing
-attack. It does not blind the input, because blinding needs a modular inverse
-and `std.crypto.ff` exposes none; and it does not use the Chinese Remainder
-Theorem even when the key carries the parameters, which is what makes it an
-order of magnitude slower than OpenSSL (13 ms for a 2048-bit signature
-against roughly 1 ms) and also what means there is no faulty recombination to
-leak the key through. It is appropriate for signing with a key on a machine
-you trust, and it is not a replacement for an HSM. The doc comment on `rsa`
-gives the numbers and the reasoning.
+**RSA's private exponentiation is constant-time and uses the CRT; it is not
+blinded.** The arithmetic is `ff`'s Montgomery arithmetic — the same `std`
+verifies certificates with — which is constant time in both the base and the
+exponent, the defence that matters against a remote timing attack. When the
+key carries the second representation, which every PKCS#1 and PKCS#8 key
+does, signing is two exponentiations modulo numbers half the width of `n`
+rather than one modulo `n`: 3.9 ms for a 2048-bit signature where the direct
+route takes 13, and 27 ms against 101 at 4096 bits.
+
+That is only safe with the check that comes with it. **Every signature is
+verified before it is released**, because a CRT signer that gets one half
+wrong — a fault in the hardware, or a key whose components disagree — emits a
+signature from which `gcd(s^e - m, n)` is one of the primes, which is the
+whole private key from one bad signature. The check costs about a fiftieth of
+the signature and a mismatch returns `error.SigningFailed` with the buffer
+wiped.
+
+It still does not blind the input, because blinding needs a modular inverse
+and `ff` exposes none; the CRT needs no inversion, because the key carries
+`qinv` already. It is appropriate for signing with a key on a machine you
+trust, and it is not a replacement for an HSM. The doc comment on `rsa` gives
+the numbers and the reasoning.
 
 ## What is here
 
@@ -140,6 +150,7 @@ gives the numbers and the reasoning.
 | `rsa.SecretKey` | An RSA private key, read from PKCS#1 or PKCS#8 DER or from the PEM around either — `fromPem` tells the two apart by looking. Held by value, so the DER it came from can be wiped. |
 | `rsa.PublicKey` | An RSA public key, from a `SubjectPublicKeyInfo` or a bare PKCS#1 `RSAPublicKey`, DER or PEM. Both shapes are accepted because formats that carry one are inconsistent about which they mean. |
 | `rsa.pkcs1v1_5.Signer(Hash)` | RFC 8017 RSASSA-PKCS1-v1_5, over SHA-1, SHA-224, SHA-256, SHA-384 or SHA-512. `sign`/`verify` over a message, `signConcat`/`verifyConcat` over its pieces, and `signDigest`/`verifyDigest` for a protocol that hashes something which never exists as contiguous bytes. |
+| `rsa.SecretKey.Crt` | RFC 8017 §3.2's second representation — the two primes and the three values derived from them — kept when the key carried them, which every PKCS#1 and PKCS#8 key does. Signing then costs a quarter of what it otherwise would, and every signature is verified before release. |
 | `ff` | `std.crypto.ff` with one function put right — the only thing here that corrects the standard library rather than adding to it. See below. |
 
 ### The carried patch

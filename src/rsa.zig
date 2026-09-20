@@ -35,33 +35,35 @@
 //! matters against a remote timing attack, and it is why this does not
 //! reimplement bignum arithmetic of its own.
 //!
+//! The Chinese Remainder Theorem is used when the key carries the
+//! parameters for it, which every PKCS#1 and PKCS#8 key does: two
+//! exponentiations modulo numbers half the width of `n` instead of one
+//! modulo `n`, which is a quarter of the work because the cost goes as the
+//! cube of the size. Measured on a 2026 x86-64 laptop, in ReleaseFast:
+//!
+//! | key      | sign    | sign, whole `d` | verify  |
+//! |----------|---------|-----------------|---------|
+//! | 2048-bit | 3.9 ms  | 13 ms           | 0.20 ms |
+//! | 4096-bit | 27 ms   | 101 ms          | 0.55 ms |
+//!
+//! Both columns include the check described below. A key built from `n`, `d`
+//! and `e` alone takes the second.
+//!
+//! **Every signature is verified before it is released**, and with the CRT
+//! that is not belt and braces but what makes it safe to use. A signer that
+//! gets one of its two halves wrong -- through a fault induced in the
+//! hardware, or a key whose components disagree -- emits a signature from
+//! which `gcd(s^e - m, n)` is one of the primes. That is the Bellcore
+//! attack, and it recovers the whole private key from a *single* bad
+//! signature. Recomputing `s^e mod n` with the public exponent costs about a
+//! fiftieth of what the signature cost, and a mismatch returns
+//! `error.SigningFailed` with the output buffer wiped.
+//!
 //! What it does **not** do is blind the input. Base blinding -- signing
 //! `m * r^e` and dividing the result by `r` -- additionally defends against
-//! fault attacks and against side channels in the surrounding code, and it
-//! cannot be built here: it needs a modular inverse, and `std.crypto.ff`
-//! exposes no inversion. Nor is the Chinese Remainder Theorem used, even when
-//! the key carries the parameters for it. Both are trade-offs made in the
-//! direction of code that can be read and checked.
-//!
-//! The CRT one is the expensive trade. Measured on a 2026 x86-64 laptop, in
-//! ReleaseFast:
-//!
-//! | key      | sign    | verify  |
-//! |----------|---------|---------|
-//! | 1024-bit | 1.9 ms  | 0.05 ms |
-//! | 2048-bit | 13 ms   | 0.20 ms |
-//!
-//! OpenSSL signs with a 2048-bit key in about a millisecond, so this is an
-//! order of magnitude off the pace, and nearly all of that is the missing
-//! CRT: exponentiating modulo p and modulo q separately is a quarter of the
-//! work, since the cost goes as the cube of the size. What it buys is that
-//! there is no recombination to get wrong. A CRT signer that produces one
-//! faulty half reveals the entire private key from that single bad signature
-//! -- the Bellcore attack -- so a careful one verifies every signature it
-//! makes before releasing it, which gives some of the speed straight back.
-//! For signing mail, where 13 ms disappears into the SMTP conversation
-//! around it, that machinery is not yet worth it. For a TLS server accepting
-//! connections it would be.
+//! side channels in the surrounding code, and it needs a modular inverse,
+//! which `ff` exposes no way to compute. The CRT needs none, because the key
+//! carries `qinv` already.
 //!
 //! **So: this is appropriate for signing with a key you hold on a machine you
 //! trust. It is not hardened against an attacker who can induce faults in the
@@ -79,7 +81,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const crypto = std.crypto;
-const ff = crypto.ff;
+/// This library's `ff` and not `std.crypto.ff`, which is the same file with
+/// two things put right: a secret exponent of exactly three bytes taking a
+/// branchy path, and `pow` sizing its exponent buffer by the type's width
+/// rather than the modulus's. Neither is reachable from the code here --
+/// which is why they were only found by measuring something else -- but a
+/// library that carries the fix should be the first to use it.
+const ff = @import("ff.zig");
 const testing = std.testing;
 
 /// The largest modulus this implementation will accept, in bits.
@@ -369,12 +377,38 @@ pub const SecretKey = struct {
     /// The public exponent, kept so that `publicKey` can hand back the other
     /// half of the pair without the caller having to carry it separately.
     e: Fe,
+    /// The Chinese remainder components, when the key carried them.
+    ///
+    /// Null for a key built from `n`, `d` and `e` alone, which then signs the
+    /// slow way. Every PKCS#1 and PKCS#8 key has them.
+    crt: ?Crt = null,
+
+    /// What RFC 8017 §3.2 calls the second representation of a private key:
+    /// the two primes and the three values derived from them, which turn one
+    /// exponentiation modulo `n` into two modulo numbers half its size.
+    ///
+    /// Held as the fields they define and the elements of those fields,
+    /// because that is what the arithmetic wants; the bytes they were parsed
+    /// from are not kept.
+    pub const Crt = struct {
+        /// The primes, as the fields they define.
+        p: Modulus,
+        q: Modulus,
+        /// `d mod (p-1)` and `d mod (q-1)`.
+        dp: Fe,
+        dq: Fe,
+        /// `q^-1 mod p`, which is what makes the recombination a
+        /// multiplication rather than an inversion -- the reason this needs
+        /// nothing `std.crypto.ff` does not have.
+        qinv: Fe,
+    };
 
     /// A secret key from a PKCS#1 `RSAPrivateKey`, which is what
     /// `-----BEGIN RSA PRIVATE KEY-----` holds.
     ///
-    /// The CRT components are parsed to the extent of being stepped over and
-    /// checked for well-formedness, but are not retained.
+    /// The CRT components are kept, which is what makes signing with this
+    /// key four times cheaper than signing with one built from `n`, `d` and
+    /// `e` alone.
     pub fn fromPkcs1Der(bytes: []const u8) ParseError!SecretKey {
         var outer: Der = .{ .buf = bytes };
         var seq = try outer.takeSeq();
@@ -389,15 +423,57 @@ pub const SecretKey = struct {
         const modulus = try seq.takeInteger();
         const public_exponent = try seq.takeInteger();
         const private_exponent = try seq.takeInteger();
-        // prime1, prime2, exponent1, exponent2, coefficient. Read and dropped:
-        // a truncated key should fail here rather than be used as if whole.
-        for (0..5) |_| _ = try seq.takeInteger();
+        // prime1, prime2, exponent1, exponent2, coefficient -- the second
+        // representation of §3.2, which is what makes signing four times
+        // cheaper. A truncated key fails here rather than being used as if
+        // whole, which is why they were read even when they were dropped.
+        const prime1 = try seq.takeInteger();
+        const prime2 = try seq.takeInteger();
+        const exponent1 = try seq.takeInteger();
+        const exponent2 = try seq.takeInteger();
+        const coefficient = try seq.takeInteger();
         // And nothing after them. A version-0 key has exactly nine fields,
         // so anything more is either a multi-prime key that lied about its
         // version or bytes that are not part of the key at all.
         if (!seq.atEnd() or !outer.atEnd()) return error.MalformedDer;
 
-        return fromComponents(modulus, public_exponent, private_exponent);
+        var key = try fromComponents(modulus, public_exponent, private_exponent);
+        key.crt = try crtFromComponents(prime1, prime2, exponent1, exponent2, coefficient);
+        return key;
+    }
+
+    /// The second representation, from the five integers that carry it.
+    ///
+    /// Everything here is checked only for being a usable field element:
+    /// that the primes really are the factors of `n`, and that the exponents
+    /// really are `d` reduced, is not checked at parse time because it does
+    /// not have to be. Every signature made with them is verified before it
+    /// is released, and a key whose components disagree with each other
+    /// fails that check on its first use -- which is also the defence
+    /// against a fault, and is therefore machinery this has to have anyway.
+    fn crtFromComponents(
+        prime1: []const u8,
+        prime2: []const u8,
+        exponent1: []const u8,
+        exponent2: []const u8,
+        coefficient: []const u8,
+    ) ParseError!Crt {
+        const p = Modulus.fromBytes(prime1, .big) catch return error.InvalidKey;
+        const q = Modulus.fromBytes(prime2, .big) catch return error.InvalidKey;
+        // A prime of one limb is not a key, and a prime wider than the
+        // modulus ceiling cannot be a factor of a modulus under it.
+        if (p.bits() < 2 or q.bits() < 2) return error.InvalidKey;
+        if (p.bits() > max_modulus_bits or q.bits() > max_modulus_bits) return error.InvalidKey;
+
+        // `Fe.fromBytes` rejects anything not already reduced, which is the
+        // check that each exponent is below the prime it belongs to and that
+        // the coefficient is below `p`.
+        const dp = Fe.fromBytes(p, exponent1, .big) catch return error.InvalidKey;
+        const dq = Fe.fromBytes(q, exponent2, .big) catch return error.InvalidKey;
+        const qinv = Fe.fromBytes(p, coefficient, .big) catch return error.InvalidKey;
+        if (dp.isZero() or dq.isZero() or qinv.isZero()) return error.InvalidKey;
+
+        return .{ .p = p, .q = q, .dp = dp, .dq = dq, .qinv = qinv };
     }
 
     /// A secret key from a PKCS#8 `PrivateKeyInfo`, which is what
@@ -459,6 +535,112 @@ pub const SecretKey = struct {
         const d = Fe.fromBytes(public.n, private_exponent, .big) catch return error.InvalidKey;
         if (d.isZero()) return error.InvalidKey;
         return .{ .n = public.n, .d = d, .e = public.e };
+    }
+
+    /// `m^d mod n`, by whichever route this key can take.
+    ///
+    /// With the second representation, two exponentiations modulo numbers
+    /// half the width of `n` instead of one modulo `n`. The cost of a
+    /// modular exponentiation goes as the cube of the operand size -- each
+    /// multiplication is quadratic and there are linearly many -- so halving
+    /// the width and doing it twice is a quarter of the work.
+    ///
+    /// §5.1.2 of RFC 8017 in the form that needs no inversion, because the
+    /// key already carries `qinv`:
+    ///
+    ///     m1 = c^dp mod p
+    ///     m2 = c^dq mod q
+    ///     h  = qinv * (m1 - m2) mod p
+    ///     m  = m2 + q*h
+    ///
+    /// The last line is arithmetic in `n` rather than plain integers: the
+    /// true value of `m2 + q*h` is below `n`, so reducing it changes nothing
+    /// and the field's `mul` and `add` can do the work.
+    ///
+    /// Constant time with respect to everything secret. The exponents go in
+    /// serialized to the full width of their primes, for the same reason `d`
+    /// does below; `reduce`, `mul`, `sub` and `add` are constant time for a
+    /// given modulus; and the moduli here are `p` and `q`, whose *widths*
+    /// are public -- half the key size -- even though their values are not.
+    fn exponentiate(self: SecretKey, m: Fe) Fe {
+        const crt = self.crt orelse return self.exponentiateWhole(m);
+
+        const p_len = std.math.divCeil(usize, crt.p.bits(), 8) catch unreachable;
+        const q_len = std.math.divCeil(usize, crt.q.bits(), 8) catch unreachable;
+
+        var dp_bytes: [max_modulus_len]u8 = undefined;
+        var dq_bytes: [max_modulus_len]u8 = undefined;
+        defer crypto.secureZero(u8, dp_bytes[0..p_len]);
+        defer crypto.secureZero(u8, dq_bytes[0..q_len]);
+        crt.dp.toBytes(dp_bytes[0..p_len], .big) catch unreachable;
+        crt.dq.toBytes(dq_bytes[0..q_len], .big) catch unreachable;
+
+        // The message taken into each prime's field. `reduce` is what makes
+        // this possible at all: `Fe.fromBytes` would refuse, since `m` is
+        // larger than either prime.
+        const m1 = crt.p.powWithEncodedExponent(
+            crt.p.reduce(m.v),
+            dp_bytes[0..p_len],
+            .big,
+        ) catch unreachable;
+        const m2 = crt.q.powWithEncodedExponent(
+            crt.q.reduce(m.v),
+            dq_bytes[0..q_len],
+            .big,
+        ) catch unreachable;
+
+        // h = qinv * (m1 - m2) mod p. `m2` belongs to q's field and has to
+        // be carried into p's before the subtraction; `sub` is modular, so
+        // the case where m2 > m1 needs no separate handling.
+        const m2_in_p = crt.p.reduce(m2.v);
+        const h = crt.p.mul(crt.p.sub(m1, m2_in_p), crt.qinv);
+
+        // m = m2 + q*h, in n's field.
+        //
+        // Through bytes rather than through `reduce`, which only goes the
+        // other way: it takes a value wider than the modulus and brings it
+        // down, and handed a narrower one it runs off the bottom of its own
+        // index. What is needed here is the opposite -- three values already
+        // smaller than `n`, carried into its field unchanged -- and
+        // `Fe.fromBytes` is that, since it accepts exactly what is already
+        // reduced.
+        const k = self.modulusLength();
+        var wide: [max_modulus_len]u8 = @splat(0);
+        crt.q.toBytes(wide[0..k], .big) catch unreachable;
+        const q_in_n = Fe.fromBytes(self.n, wide[0..k], .big) catch unreachable;
+        h.toBytes(wide[0..k], .big) catch unreachable;
+        const h_in_n = Fe.fromBytes(self.n, wide[0..k], .big) catch unreachable;
+        m2.toBytes(wide[0..k], .big) catch unreachable;
+        const m2_in_n = Fe.fromBytes(self.n, wide[0..k], .big) catch unreachable;
+
+        return self.n.add(m2_in_n, self.n.mul(q_in_n, h_in_n));
+    }
+
+    /// `m^d mod n` the direct way, for a key with no second representation.
+    fn exponentiateWhole(self: SecretKey, m: Fe) Fe {
+        const k = self.modulusLength();
+        // `powWithEncodedExponent` is the constant-time one; `powPublic`
+        // next to it is not, and using it here would leak `d` through
+        // timing.
+        //
+        // The exponent is written into exactly `k` bytes rather than the
+        // field element's full width. d < n, so it always fits, and the
+        // exponentiation walks every bit it is given: at the full 4096-bit
+        // width a 2048-bit key would pay for 2048 leading zero bits it does
+        // not have.
+        //
+        // Exactly `k`, and not any shorter. `std.crypto.ff` decides between
+        // its constant-time table walk and a short-exponent loop with a
+        // data-dependent branch by looking at the exponent's *length*, and
+        // upstream's test for that has a precedence slip which sends a
+        // three-byte secret exponent down the branchy path. `src/ff.zig`
+        // fixes it; `k` being at least 64 here is what made it unreachable
+        // before that, and an optimisation that serialized `d` at its
+        // minimal length would not have had that guarantee.
+        var d_bytes: [max_modulus_len]u8 = undefined;
+        defer crypto.secureZero(u8, d_bytes[0..k]);
+        self.d.toBytes(d_bytes[0..k], .big) catch unreachable;
+        return self.n.powWithEncodedExponent(m, d_bytes[0..k], .big) catch unreachable;
     }
 
     /// The matching public key.
@@ -545,6 +727,16 @@ pub const pkcs1v1_5 = struct {
         /// 62-byte modulus and SHA-512 a 94-byte one. Any real key clears
         /// this; a 512-bit modulus with SHA-512 does not.
         ModulusTooShort,
+        /// The signature this key produced did not verify against the
+        /// message it was made over, so it was not released.
+        ///
+        /// Not reachable by ordinary means: it says that the arithmetic
+        /// produced the wrong answer, which is either a key whose components
+        /// contradict each other or a fault in the machine. It exists
+        /// because the alternative to noticing is handing out a signature
+        /// that reveals the private key -- see the note where it is
+        /// returned.
+        SigningFailed,
     };
 
     /// What can go wrong checking one.
@@ -632,33 +824,42 @@ pub const pkcs1v1_5 = struct {
                 const em = out[0..k];
                 try encode(em, digest);
 
-                // s = m^d mod n. `powWithEncodedExponent` is the constant-time
-                // one; `powPublic` next to it is not, and using it here would
-                // leak the private exponent through timing.
-                //
-                // The exponent is written into exactly `k` bytes rather than
-                // the field element's full width. d < n, so it always fits,
-                // and the exponentiation walks every bit it is given: at the
-                // full 4096-bit width a 2048-bit key would pay for 2048
-                // leading zero bits it does not have.
-                //
-                // Exactly `k`, and not any shorter. `std.crypto.ff` decides
-                // between its constant-time table walk and a short-exponent
-                // loop with a data-dependent branch by looking at the
-                // exponent's *length*, and a precedence slip in that test
-                // (0.16.0: `public and len < 3 or (len == 3 and ...)`) sends
-                // a three-byte exponent with a small top nibble down the
-                // branchy path even when it is marked secret. `k` is at
-                // least 64 here, which is what keeps this out of reach; an
-                // optimisation that serialised `d` at its minimal length
-                // would not have that guarantee.
-                var d_bytes: [max_modulus_len]u8 = undefined;
-                defer crypto.secureZero(u8, d_bytes[0..k]);
-                secret_key.d.toBytes(d_bytes[0..k], .big) catch unreachable;
-
                 const m = Fe.fromBytes(secret_key.n, em, .big) catch unreachable;
-                const s = secret_key.n.powWithEncodedExponent(m, d_bytes[0..k], .big) catch unreachable;
-                s.toBytes(em, .big) catch unreachable;
+                const sig = secret_key.exponentiate(m);
+
+                // Every signature is checked before it is released, and with
+                // the second representation that is not belt and braces but
+                // the thing that makes it safe to use at all.
+                //
+                // A CRT signer that gets one of its two halves wrong --
+                // through a fault induced in the hardware, a cosmic ray, or
+                // a key whose components disagree -- emits a signature from
+                // which `gcd(s^e - m, n)` is one of the primes. That is the
+                // Bellcore attack, and it recovers the entire private key
+                // from a *single* bad signature, so the faulty output must
+                // never leave this function. Recomputing `s^e mod n` with
+                // the public exponent costs about a fiftieth of what the
+                // signature cost and closes it.
+                //
+                // `powPublic` is the right one here: `e` is public, and the
+                // value being exponentiated is the signature, which is about
+                // to be handed to the caller.
+                const check = secret_key.n.powPublic(sig, secret_key.e) catch unreachable;
+                // Both buffers zeroed in full and only their first `k` bytes
+                // written, so the comparison is over whole arrays -- the same
+                // shape the verifier next door uses, and for the same reason.
+                var check_bytes: [max_modulus_len]u8 = @splat(0);
+                var encoded: [max_modulus_len]u8 = @splat(0);
+                check.toBytes(check_bytes[0..k], .big) catch unreachable;
+                @memcpy(encoded[0..k], em);
+                if (!crypto.timing_safe.eql([max_modulus_len]u8, check_bytes, encoded)) {
+                    // The buffer holds a half-made signature, and a caller
+                    // that ignored the error would otherwise release it.
+                    crypto.secureZero(u8, em);
+                    return error.SigningFailed;
+                }
+
+                sig.toBytes(em, .big) catch unreachable;
                 return em;
             }
 
@@ -721,7 +922,12 @@ pub const pkcs1v1_5 = struct {
 
             /// EMSA-PKCS1-v1_5, RFC 8017 §9.2: fills `em` with
             /// `0x00 || 0x01 || 0xFF... || 0x00 || DigestInfo`.
-            fn encode(em: []u8, digest: [Hash.digest_length]u8) SignError!void {
+            /// Its own error set rather than `SignError`, which is wider than
+            /// what padding a buffer can go wrong with and which the verifier
+            /// also has to switch over.
+            const EncodeError = error{ ModulusTooShort, BufferTooSmall };
+
+            fn encode(em: []u8, digest: [Hash.digest_length]u8) EncodeError!void {
                 // §9.2 step 3: at least eight 0xFF bytes, plus the two leading
                 // bytes and the separator.
                 if (em.len < digest_info_len + 11) return error.ModulusTooShort;
@@ -1073,6 +1279,57 @@ test "OpenSSL's signatures verify here" {
         error.InvalidSignature,
         pkcs1v1_5.Signer(Sha1).verify(sig, test_message, pk),
     );
+}
+
+test "the two representations sign identically" {
+    // The second representation is an optimisation and nothing else: the
+    // signature it produces is the signature the direct route produces, or
+    // it is wrong. `signatures match OpenSSL byte for byte` already checks
+    // the CRT path against a third party, so what this adds is the two
+    // halves of this file checked against each other on the same key.
+    var der_buf: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der_buf, key_2048_pkcs8);
+    try testing.expect(sk.crt != null);
+
+    var whole = sk;
+    whole.crt = null;
+
+    var a: [max_modulus_len]u8 = undefined;
+    var b: [max_modulus_len]u8 = undefined;
+    const with = try pkcs1v1_5.Signer(Sha256).sign(&a, test_message, sk);
+    const without = try pkcs1v1_5.Signer(Sha256).sign(&b, test_message, whole);
+    try testing.expectEqualSlices(u8, without, with);
+}
+
+test "a key whose components contradict each other signs nothing" {
+    // The Bellcore attack in the form this library can be made to suffer it.
+    // A CRT signer that gets one half wrong emits a signature from which
+    // `gcd(s^e - m, n)` is one of the primes -- the whole private key, from
+    // one bad signature. Inducing a hardware fault is not something a test
+    // can do, but corrupting a component has the same effect on the
+    // arithmetic, and what must happen is that nothing comes out.
+    var der_buf: [max_secret_key_der]u8 = undefined;
+    var sk = try SecretKey.fromPem(&der_buf, key_2048_pkcs8);
+
+    // `qinv` off by one: still a perfectly good field element, so nothing
+    // upstream of the signature rejects it.
+    const crt = sk.crt.?;
+    sk.crt.?.qinv = crt.p.add(crt.qinv, crt.p.one());
+
+    var sig: [max_modulus_len]u8 = undefined;
+    try testing.expectError(
+        error.SigningFailed,
+        pkcs1v1_5.Signer(Sha256).sign(&sig, test_message, sk),
+    );
+
+    // And the buffer does not hold the faulty signature: a caller that
+    // ignored the error would otherwise publish exactly what must not be
+    // published.
+    var zeroed = true;
+    for (sig[0..sk.modulusLength()]) |byte| {
+        if (byte != 0) zeroed = false;
+    }
+    try testing.expect(zeroed);
 }
 
 test "a signature does not verify against a message it was not made over" {
