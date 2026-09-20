@@ -13,7 +13,43 @@
 //! Parts of that code was ported from the BSD-licensed crypto/internal/bigmod/nat.go file in the Go language, itself inspired from BearSSL.
 //! ## What is changed from the standard library
 //!
-//! One function: `Modulus.pow`, which serializes the secret exponent before
+//! Two things, in two functions. One is a timing leak; the other is half the
+//! work of every RSA signature.
+//!
+//! ### A secret exponent down the branchy path
+//!
+//! `powWithEncodedExponentInternal` chooses between a constant-time walk over
+//! a precomputation table and a short-exponent loop that branches on the
+//! exponent's bits. The test that chooses reads, upstream:
+//!
+//! ```zig
+//! if (public and e.len < 3 or (e.len == 3 and e[...] <= 0b1111))
+//! ```
+//!
+//! and `and` binds tighter than `or`, so it means `(public and short) or
+//! (three bytes and small)`. The second half never asks whether the exponent
+//! is public. A three-byte *secret* exponent with a small top nibble
+//! therefore takes the branchy path, where the work depends on the bits of
+//! the secret. Parenthesising it is the whole fix.
+//!
+//! `zig build timing` measures it rather than asserting it, by the dudect
+//! method the rest of that harness uses. Welch's t between a fixed and a
+//! random three-byte secret exponent is about **2400** before this change.
+//! After it, single digits -- 9.7 at 175,000 samples and 5.9 at 400,000,
+//! which is the harness's "suspicious" band rather than its "leak" band
+//! (ten), and falling as samples rise, which is what a constant-time
+//! function does and a leaking one does not. The means move from 530,000
+//! cycles against 710,000 -- the two classes plainly doing different amounts
+//! of work -- to the same number either way.
+//!
+//! Whether it is reachable depends on the caller: an RSA key whose private
+//! exponent is three bytes is broken for other reasons, but `ff` is general,
+//! and a protocol that uses short secret exponents on purpose would leak
+//! them.
+//!
+//! ### Half the squarings, on leading zeros
+//!
+//! `Modulus.pow`, which serializes the secret exponent before
 //! handing it to the ladder. It sized that buffer by `Fe.encoded_bytes` --
 //! the *type's* maximum width -- where it should have used the modulus's
 //! own. The ladder spends four squarings on every nibble it is given, so the
@@ -37,7 +73,8 @@
 //! length would depend on the secret.
 //!
 //! `tests/ff.zig` checks the two implementations agree, across the widths
-//! where they differ and the widths where they should not.
+//! where they differ and the widths where they should not, and
+//! `zig build timing` checks the first change with a clock.
 //!
 //! This is a carried patch and not a fork: the intent is that it goes
 //! upstream and this file then goes away.
@@ -741,7 +778,16 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
             var out = self.one();
             self.toMontgomery(&out) catch unreachable;
 
-            if (public and e.len < 3 or (e.len == 3 and e[if (endian == .big) 0 else 2] <= 0b1111)) {
+            // Parenthesised, which upstream is not: `and` binds tighter than
+            // `or`, so `public and e.len < 3 or (e.len == 3 and ...)` reads
+            // as `(public and short) or (three bytes and small)` and the
+            // second half never asks whether the exponent is public. A
+            // three-byte *secret* exponent with a small top nibble therefore
+            // took the branchy path below, where the work depends on the bits
+            // of the exponent. `zig build timing` measures it: before this,
+            // Welch's t between a fixed and a random three-byte secret
+            // exponent is about 2400, where ten is already a leak.
+            if (public and (e.len < 3 or (e.len == 3 and e[if (endian == .big) 0 else 2] <= 0b1111))) {
                 // Do not use a precomputation table for short, public exponents
                 var x_m = x;
                 if (!x.montgomery) {

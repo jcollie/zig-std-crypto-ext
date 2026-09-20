@@ -44,6 +44,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const des = @import("des");
+const ext = des;
 
 /// Cycles, from a counter that costs nothing to read and cannot be reordered
 /// with the code around it.
@@ -284,6 +285,57 @@ fn parityOp(input: *const Input) u64 {
     return end - start;
 }
 
+/// A three-byte *secret* exponent through `ff.powWithEncodedExponent`.
+///
+/// `std.crypto.ff` chooses between a constant-time table walk and a short
+/// exponent loop with a data-dependent branch, and in 0.16.0 the test that
+/// makes that choice reads
+///
+/// ```zig
+/// if (public and e.len < 3 or (e.len == 3 and e[0] <= 0b1111))
+/// ```
+///
+/// which `and` binding tighter than `or` turns into `(public and short) or
+/// (three bytes and small)`. The second half never asks whether the exponent
+/// is public, so a three-byte secret exponent with a small top nibble goes
+/// down the branchy path and its bits show up in the timing. `src/ff.zig`
+/// parenthesises it; this is what says so.
+///
+/// Fixed class: an exponent of three zero-ish bytes. Random class: three
+/// random bytes under the same top-nibble bound, so both classes take the
+/// same branch in the *patched* code and differ only in bits the loop would
+/// branch on in the unpatched one.
+fn shortSecretExponentOp(input: *const Input) u64 {
+    const M = ext.ff.Modulus(2048);
+    const m = M.fromBytes(&exponent_modulus, .big) catch unreachable;
+    const x = M.Fe.fromBytes(m, input.block[0..16], .big) catch unreachable;
+    const start = cycles();
+    const out = m.powWithEncodedExponent(x, input.key[0..3], .big) catch unreachable;
+    const end = cycles();
+    std.mem.doNotOptimizeAway(out);
+    return end - start;
+}
+
+/// A fixed 2048-bit modulus for the exponent timing, odd and full width.
+const exponent_modulus: [256]u8 = blk: {
+    var m: [256]u8 = @splat(0x5a);
+    m[0] = 0xd3;
+    m[255] = 0x8f;
+    break :blk m;
+};
+
+fn shortExponent(class: bool, random: std.Random, input: *Input) void {
+    input.* = .{ .key = @splat(0), .block = @splat(0x42) };
+    if (class) random.bytes(input.key[0..3]);
+    // Both classes keep the top nibble small, which is the condition that
+    // sends a three-byte exponent down the short path: the classes must
+    // differ in the exponent's *bits*, not in which branch is taken, or the
+    // test measures the branch rather than the leak.
+    input.key[0] &= 0x0f;
+    // And a non-zero exponent, which `powWithEncodedExponent` insists on.
+    input.key[2] |= 1;
+}
+
 /// The positive control: a loop whose count is the first key byte, doing
 /// something the compiler cannot fold into a closed form.
 fn leakyOp(input: *const Input) u64 {
@@ -306,6 +358,7 @@ const measurements = [_]Measurement{
     .{ .name = "AES-192-CFB, 24 bytes", .prepare = zerosOrRandom, .op = cfbOp },
     .{ .name = "isWeak", .prepare = weakOrRandom, .op = isWeakOp },
     .{ .name = "setOddParity + hasOddParity", .prepare = zerosOrRandom, .op = parityOp },
+    .{ .name = "ff: three-byte secret exponent", .prepare = shortExponent, .op = shortSecretExponentOp },
 };
 
 pub fn main(init: std.process.Init) !void {
