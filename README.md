@@ -5,9 +5,10 @@ SPDX-License-Identifier: MIT
 
 # zig-std-crypto-ext
 
-The ciphers, modes and signatures `std.crypto` leaves out: **DES**, **Triple
-DES**, **AES-192**, **CBC, CFB and ECB** generic over any block cipher, and
-**RSA signing**.
+The ciphers, modes, signatures and constructions `std.crypto` leaves out:
+**DES**, **Triple DES**, **AES-192**, **CBC, CFB and ECB** generic over any
+block cipher, **RSA signing**, and libsodium's **XChaCha20 secretbox and box**
+with the **HChaCha20** underneath them.
 
 Named for what it is rather than for its first occupant — it started as
 `zig-des`, and DES is now the smaller half of it.
@@ -61,6 +62,16 @@ mode, and RFC 3826 [7] specifies **AES**-128 in full-block CFB for SNMPv3. So on
 library has to supply a cipher `std` omits and a mode `std` omits, for two
 different ciphers — which is why `modes` is generic over the cipher rather than
 tied to DES.
+
+**The two ChaCha pieces are here for a third reason, and neither is
+obsolete.** HChaCha20 `std` implements and keeps private, inside
+`XChaCha20Poly1305`; the XChaCha20 secretbox it does not have at all, because
+it ships the RFC 8439 AEAD [15] and the NaCl secretbox over XSalsa20 and not
+the combination of NaCl's construction with XChaCha20 — which is the one
+libsodium's `crypto_box_curve25519xchacha20poly1305` is, and the one DNSCrypt's
+es-version 2 is [16]. Those two constructions take the same key and the same
+nonce, are both called "XChaCha20-Poly1305", and produce different bytes, so
+reaching for the one in `std` yields a box no peer will open.
 
 **RSA is here for a different reason, and it is not obsolete.** Zig 0.16 does
 ship RSA, but only half of it and only as an implementation detail of
@@ -152,6 +163,7 @@ the numbers and the reasoning.
 | `rsa.pkcs1v1_5.Signer(Hash)` | RFC 8017 RSASSA-PKCS1-v1_5, over SHA-1, SHA-224, SHA-256, SHA-384 or SHA-512. `sign`/`verify` over a message, `signConcat`/`verifyConcat` over its pieces, and `signDigest`/`verifyDigest` for a protocol that hashes something which never exists as contiguous bytes. |
 | `rsa.SecretKey.Crt` | RFC 8017 §3.2's second representation — the two primes and the three values derived from them — kept when the key carried them, which every PKCS#1 and PKCS#8 key does. Signing then costs a quarter of what it otherwise would, and every signature is verified before release. |
 | `hChaCha20` | The key derivation `std.crypto` has and does not hand over: it is a private function inside the ChaCha implementation, reached only by `XChaCha20Poly1305`. libsodium's XChaCha20 box applies it a second time, to turn an X25519 shared point into the key the box is opened with, so a caller outside `std` needs it — DNSCrypt's es-version 2 is exactly that construction [14]. |
+| `XChaCha20SecretBox`, `XChaCha20Box` | libsodium's `crypto_secretbox_xchacha20poly1305` and `crypto_box_curve25519xchacha20poly1305`: the NaCl secretbox construction with XChaCha20 in it, tag first. `std` has the RFC 8439 AEAD of that name [15] and the NaCl secretbox over XSalsa20, and not this third combination — which is what DNSCrypt's es-version 2 uses [16], and produces different bytes from the AEAD under the same key and nonce. Every vector came from libsodium itself [17]. |
 | `ff` | `std.crypto.ff` with one function put right — the only thing here that corrects the standard library rather than adding to it. See below. |
 
 ### The carried patch
@@ -415,6 +427,20 @@ $ nix develop -c zig build docs-serve   # http://127.0.0.1:8000
     defines HChaCha20 and §2.2.1 is the vector `hchacha20.zig` is pinned by;
     §2.3 is the subkey-and-nonce split the differential test against `std`'s
     own copy relies on.
+15. Yoav Nir and Adam Langley, *ChaCha20 and Poly1305 for IETF Protocols*,
+    RFC 8439, June 2018. <https://www.rfc-editor.org/rfc/rfc8439>. The AEAD
+    that `XChaCha20SecretBox` is **not**, and §2.3 the ChaCha20 quarter-round
+    and constants `hchacha20.zig` is written from.
+16. Frank Denis, *DNSCrypt*, Internet-Draft
+    draft-denis-dprive-dnscrypt, work in progress.
+    <https://dnscrypt.github.io/dnscrypt-protocol/>. Its Appendix 1 names the
+    `XChaCha20_DJB-Poly1305` construction and says in as many words that it is
+    the NaCl secretbox layout rather than RFC 8439's AEAD, which is why this
+    library holds it.
+17. Frank Denis and contributors, *libsodium* 1.0.22.
+    <https://doc.libsodium.org/>. `crypto_secretbox_xchacha20poly1305_easy`
+    and `crypto_box_curve25519xchacha20poly1305_beforenm`, called through
+    `ctypes`, produced every number in `xchacha20_secretbox.zig`'s tests.
 
 ## Licence
 
