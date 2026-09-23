@@ -345,6 +345,18 @@ inside the buffer and terminate — seeded with a real key so that mutations
 reach past the first tag. The verifier gets the strong one: every input is a
 forgery, and every one has to be refused.
 
+The XChaCha20 box gets a target of its own, and two of its three properties are
+things no vector can say. Its construction has a seam in the middle — the first
+32 bytes of the message ride in the block that also carries the Poly1305 key, and
+everything after them comes from block 1 — so the lengths either side of 32 are
+where an off-by-one would live, and a fuzzer walks all of them. And the subkey
+derivation is checked *differentially against `std`'s own copy of the function it
+will not export*: `XChaCha20Poly1305` derives its subkey with the private
+`hchacha20` inside `ChaChaImpl`, so if this library's `hChaCha20` and that one
+ever disagree by an index or a byte order, two ciphertexts computed from
+arbitrary input stop matching. The same target asserts the trap in the other
+direction, that the box and that AEAD never agree on anything.
+
 `zig build timing` measures the constant-time claim instead of trusting it.
 It is the test from dudect [12]: DES, Triple DES, AES-192, the key helpers,
 and DES-CBC and AES-192-CFB over a few blocks are each timed on a fixed input

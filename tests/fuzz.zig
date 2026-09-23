@@ -33,6 +33,8 @@ const Aes192 = des.Aes192;
 const AesEncryptCtx = std.crypto.core.aes.AesEncryptCtx;
 const rsa = des.rsa;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const SecretBox = des.XChaCha20SecretBox;
+const hChaCha20 = des.hChaCha20;
 
 /// Unused here -- nothing in this library allocates -- but the standalone
 /// driver sets it, so it has to exist.
@@ -223,6 +225,153 @@ fn fuzzCipher(_: void, smith: *Smith) !void {
     const len = smith.slice(&buffer);
     try cipherProperty(buffer[0..len]);
 }
+
+// -- the XChaCha20 box ------------------------------------------------------
+
+/// Three properties over a key, a nonce and a message the fuzzer chose.
+///
+/// The published vectors beside `xchacha20_secretbox.zig` pin three lengths
+/// against libsodium, which is the only thing that can say this construction is
+/// the right one. What they cannot do is cover every length, and this is a
+/// construction with a seam in the middle of it: the first 32 bytes of the
+/// message ride in the block that also carries the Poly1305 key, and everything
+/// after them comes from block 1. So the lengths either side of 32 are where an
+/// off-by-one lives, and a fuzzer walks all of them.
+///
+/// The third property is the one worth the most, and it is a differential test
+/// against `std`'s own copy of a function it will not export: `XChaCha20Poly1305`
+/// derives its subkey with the private `hchacha20` inside `ChaChaImpl`, so if
+/// this library's `hChaCha20` and that one ever disagree by a byte order or an
+/// index, the two ciphertexts below stop matching. No vector is needed for it,
+/// which is what lets it run on arbitrary input.
+fn xboxProperty(input: []const u8) !void {
+    const overhead = SecretBox.key_length + SecretBox.nonce_length;
+    if (input.len < overhead) return;
+    const key = input[0..SecretBox.key_length].*;
+    const nonce = input[SecretBox.key_length..][0..SecretBox.nonce_length].*;
+    const message = input[overhead..];
+
+    var box: [2048 + SecretBox.tag_length]u8 = undefined;
+    if (message.len > 2048) return;
+    const sealed = box[0 .. message.len + SecretBox.tag_length];
+
+    SecretBox.seal(sealed, message, nonce, key);
+
+    var back: [2048]u8 = undefined;
+    try SecretBox.open(back[0..message.len], sealed, nonce, key);
+    try testing.expectEqualSlices(u8, message, back[0..message.len]);
+
+    // The detached form writes the same bytes in two pieces, which is what a
+    // caller with a tag of its own gets.
+    var detached: [2048]u8 = undefined;
+    var tag: [SecretBox.tag_length]u8 = undefined;
+    SecretBox.sealDetached(detached[0..message.len], &tag, message, nonce, key);
+    try testing.expectEqualSlices(u8, sealed[0..SecretBox.tag_length], &tag);
+    try testing.expectEqualSlices(u8, sealed[SecretBox.tag_length..], detached[0..message.len]);
+
+    // Authentication, at the places a break would show: the first and last
+    // bytes of the tag, the two either side of the tag-ciphertext boundary, the
+    // last byte of the ciphertext, and one byte chosen by the input itself so
+    // that the middle is covered over many runs.
+    const positions = [_]usize{
+        0,
+        SecretBox.tag_length - 1,
+        SecretBox.tag_length,
+        sealed.len - 1,
+        SecretBox.tag_length + message.len / 2,
+        SecretBox.tag_length + (@as(usize, key[0]) *% 31) % @max(1, message.len),
+    };
+    for (positions) |i| {
+        if (i >= sealed.len) continue;
+        var altered: [2048 + SecretBox.tag_length]u8 = undefined;
+        @memcpy(altered[0..sealed.len], sealed);
+        altered[i] ^= 0x01;
+        try testing.expectError(
+            error.AuthenticationFailed,
+            SecretBox.open(back[0..message.len], altered[0..sealed.len], nonce, key),
+        );
+    }
+
+    // And the differential test against `std`'s private HChaCha20: our subkey,
+    // handed to the 12-byte-nonce AEAD, must produce exactly what the 24-byte
+    // one produces from the whole nonce.
+    const XChaCha = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+    const ChaCha = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+
+    var long: [2048]u8 = undefined;
+    var long_tag: [XChaCha.tag_length]u8 = undefined;
+    XChaCha.encrypt(long[0..message.len], &long_tag, message, "", nonce, key);
+
+    var short_nonce: [ChaCha.nonce_length]u8 = @splat(0);
+    short_nonce[4..].* = nonce[16..24].*;
+    var short: [2048]u8 = undefined;
+    var short_tag: [ChaCha.tag_length]u8 = undefined;
+    ChaCha.encrypt(
+        short[0..message.len],
+        &short_tag,
+        message,
+        "",
+        short_nonce,
+        hChaCha20(nonce[0..16].*, key),
+    );
+    try testing.expectEqualSlices(u8, long[0..message.len], short[0..message.len]);
+    try testing.expectEqualSlices(u8, &long_tag, &short_tag);
+
+    // The trap the file exists to name: that AEAD is *not* this box, and the two
+    // never agree on the bytes they produce.
+    //
+    // The claim is about the whole box rather than about the ciphertext alone,
+    // and the difference matters. The two ciphertexts come from different parts
+    // of the keystream, so for a short message they coincide by chance -- one
+    // time in 256 for a single byte, which this fuzzer duly found within four
+    // minutes on a one-byte message whose two ciphertexts were both `06`.
+    // Comparing tag and ciphertext together makes it a claim about 128 bits of
+    // Poly1305 output, which holds at every length including the empty one.
+    var long_box: [2048 + XChaCha.tag_length]u8 = undefined;
+    long_box[0..XChaCha.tag_length].* = long_tag;
+    @memcpy(long_box[XChaCha.tag_length..][0..message.len], long[0..message.len]);
+    try testing.expect(!std.mem.eql(u8, sealed, long_box[0..sealed.len]));
+}
+
+test "fuzz the XChaCha20 box" {
+    for (xbox_seeds) |seed| try xboxProperty(seed);
+    try testing.fuzz({}, fuzzXbox, .{});
+}
+
+fn fuzzXbox(_: void, smith: *Smith) !void {
+    var buffer: [512]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try xboxProperty(buffer[0..len]);
+}
+
+/// A key and a nonce, and then the lengths that matter: nothing, one byte,
+/// either side of the 32 bytes that ride in the first block, and either side of
+/// a whole further block.
+const xbox_seeds = blk: {
+    const head = "\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f" ++
+        "\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f" ++
+        "\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b" ++
+        "\x4c\x4d\x4e\x4f\x50\x51\x52\x53\x54\x55\x56\x57";
+    break :blk [_][]const u8{
+        // Too short to be a key and a nonce at all, which the property must
+        // survive rather than index past.
+        "",
+        "\x00" ** 55,
+        head,
+        head ++ "q",
+        head ++ "q" ** 31,
+        head ++ "q" ** 32,
+        head ++ "q" ** 33,
+        head ++ "q" ** 63,
+        head ++ "q" ** 64,
+        head ++ "q" ** 65,
+        // A padded DNSCrypt query, which is what this is for.
+        head ++ "a DNSCrypt query, padded to sixty-four bytes\x80" ++ "\x00" ** 19,
+        // All zeroes and all ones, both of which are real keys and nonces.
+        "\x00" ** 128,
+        "\xff" ** 128,
+    };
+};
 
 // -- seeds ------------------------------------------------------------------
 
@@ -503,5 +652,11 @@ pub const all = [_]Target{
         .run = Driven(fuzzVerify).run,
         .corpus = &key_seeds,
         .content_max = 256,
+    },
+    .{
+        .name = "xbox",
+        .run = Driven(fuzzXbox).run,
+        .corpus = &xbox_seeds,
+        .content_max = 512,
     },
 };
