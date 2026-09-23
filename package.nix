@@ -64,7 +64,7 @@ stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "DES, Triple DES, and the block cipher modes std.crypto leaves out";
+    description = "The ciphers, modes and primitives std.crypto leaves out: DES, Triple DES, AES-192, CBC, CFB, ECB, RSA signing, HChaCha20";
     homepage = "https://git.jcollie.dev/jeff/zig-std-crypto-ext";
     license = lib.licenses.mit;
     platforms = lib.platforms.all;

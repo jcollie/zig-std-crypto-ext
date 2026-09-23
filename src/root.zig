@@ -74,6 +74,12 @@ pub const aes192 = @import("aes192.zig");
 /// the certificate parser, and no private key type at all. The file says what
 /// that costs and what this does and does not promise.
 pub const rsa = @import("rsa.zig");
+/// HChaCha20, which `std.crypto` has and does not hand over: it is a private
+/// function inside the ChaCha implementation, reached only by
+/// `XChaCha20Poly1305`. libsodium's XChaCha20 box needs it a second time, to
+/// turn an X25519 shared point into the key -- which is what DNSCrypt's
+/// es-version 2 is -- so a caller outside `std` has to have it.
+pub const hchacha20 = @import("hchacha20.zig");
 
 /// `std.crypto.ff` with one function put right.
 ///
@@ -93,6 +99,7 @@ pub const ff = @import("ff.zig");
 pub const Des = cipher.Des;
 pub const Des3 = cipher.Des3;
 pub const Aes192 = aes192.Aes192;
+pub const hChaCha20 = hchacha20.hChaCha20;
 pub const weak_keys = cipher.weak_keys;
 pub const isWeak = cipher.isWeak;
 pub const hasOddParity = cipher.hasOddParity;
@@ -107,4 +114,5 @@ test {
     _ = modes;
     _ = aes192;
     _ = rsa;
+    _ = hchacha20;
 }

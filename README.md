@@ -151,6 +151,7 @@ the numbers and the reasoning.
 | `rsa.PublicKey` | An RSA public key, from a `SubjectPublicKeyInfo` or a bare PKCS#1 `RSAPublicKey`, DER or PEM. Both shapes are accepted because formats that carry one are inconsistent about which they mean. |
 | `rsa.pkcs1v1_5.Signer(Hash)` | RFC 8017 RSASSA-PKCS1-v1_5, over SHA-1, SHA-224, SHA-256, SHA-384 or SHA-512. `sign`/`verify` over a message, `signConcat`/`verifyConcat` over its pieces, and `signDigest`/`verifyDigest` for a protocol that hashes something which never exists as contiguous bytes. |
 | `rsa.SecretKey.Crt` | RFC 8017 §3.2's second representation — the two primes and the three values derived from them — kept when the key carried them, which every PKCS#1 and PKCS#8 key does. Signing then costs a quarter of what it otherwise would, and every signature is verified before release. |
+| `hChaCha20` | The key derivation `std.crypto` has and does not hand over: it is a private function inside the ChaCha implementation, reached only by `XChaCha20Poly1305`. libsodium's XChaCha20 box applies it a second time, to turn an X25519 shared point into the key the box is opened with, so a caller outside `std` needs it — DNSCrypt's es-version 2 is exactly that construction [14]. |
 | `ff` | `std.crypto.ff` with one function put right — the only thing here that corrects the standard library rather than adding to it. See below. |
 
 ### The carried patch
@@ -407,6 +408,13 @@ $ nix develop -c zig build docs-serve   # http://127.0.0.1:8000
 13. The OpenSSL Project, *OpenSSL* 3.6.3, `openssl enc` with the legacy
     provider. <https://www.openssl.org/>. The independent implementation
     every vector was checked against.
+14. Scott Arciszewski, *XChaCha: eXtended-nonce ChaCha and
+    AEAD_XChaCha20_Poly1305*, Internet-Draft draft-irtf-cfrg-xchacha-03,
+    10 January 2020.
+    <https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha-03>. §2.2
+    defines HChaCha20 and §2.2.1 is the vector `hchacha20.zig` is pinned by;
+    §2.3 is the subkey-and-nonce split the differential test against `std`'s
+    own copy relies on.
 
 ## Licence
 
