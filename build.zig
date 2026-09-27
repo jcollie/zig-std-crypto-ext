@@ -7,7 +7,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // One module, and no dependencies at all: a block cipher and its modes
+    // One module, and no dependencies at all -- the one in build.zig.zon is
+    // test vectors, fetched only for the tests. A block cipher and its modes
     // need nothing but `std`, and keeping it that way is most of the point of
     // pulling this out of a protocol library. Anything that knows where a key
     // *came from* -- a password localised to an engine ID, a session key --
@@ -25,6 +26,23 @@ pub fn build(b: *std.Build) void {
     // out would not fail: its tests would simply never run.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+
+    // CPace against the draft's own test vectors, from the CFRG's repository
+    // for it: a lazy dependency, fetched for these tests and never for
+    // anything that only uses the library.
+    if (b.lazyDependency("cpace_draft", .{})) |draft| {
+        const cpace_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/cpace.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "std_crypto_ext", .module = mod }},
+            }),
+        });
+        cpace_tests.root_module.addAnonymousImport("cpace_vectors", .{ .root_source_file = draft.path("testvectors.json") });
+        cpace_tests.root_module.addAnonymousImport("cpace_vectors_md", .{ .root_source_file = draft.path("testvectors.md") });
+        test_step.dependOn(&b.addRunArtifact(cpace_tests).step);
+    }
 
     // The fuzz targets: what the ciphers and modes must do with keys and data
     // nobody chose.

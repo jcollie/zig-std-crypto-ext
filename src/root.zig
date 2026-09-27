@@ -94,6 +94,13 @@ pub const hchacha20 = @import("hchacha20.zig");
 /// the two are not interchangeable. The file says how they differ.
 pub const xchacha20_secretbox = @import("xchacha20_secretbox.zig");
 
+/// CPace, the balanced PAKE the CFRG recommends, in its CPACE-X25519-SHA512
+/// suite with explicit key confirmation: two parties who share a PIN end with
+/// a strong shared key, and an attacker gets one guess per run. `std.crypto`
+/// has the curve, the hash and the MAC, and not the protocol. Sendspin pairs
+/// a player with a server over it.
+pub const cpace = @import("cpace.zig");
+
 /// `std.crypto.ff` with one function put right.
 ///
 /// The only thing here that is not an addition to the standard library but a
@@ -110,6 +117,7 @@ pub const ff = @import("ff.zig");
 /// The pieces a caller reaches for most often, spelled without the layer in
 /// between.
 pub const Des = cipher.Des;
+pub const CPace = cpace.CPace;
 pub const Des3 = cipher.Des3;
 pub const Aes192 = aes192.Aes192;
 pub const hChaCha20 = hchacha20.hChaCha20;

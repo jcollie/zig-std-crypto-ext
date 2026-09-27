@@ -4,7 +4,7 @@ SPDX-PackageSupplier = "Jeffrey C. Ollie <jeff@ocjtech.us>"
 SPDX-PackageDownloadLocation = "https://git.jcollie.dev/jeff/zig-std-crypto-ext"
 
 [[annotations]]
-path = ["flake.lock", "build.zig.zon", ".gitignore"]
+path = ["flake.lock", "build.zig.zon", "build.zig.zon.nix", ".gitignore"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 Jeffrey C. Ollie <jeff@ocjtech.us>"
 SPDX-License-Identifier = "MIT"

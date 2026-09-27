@@ -7,8 +7,8 @@ SPDX-License-Identifier: MIT
 
 The ciphers, modes, signatures and constructions `std.crypto` leaves out:
 **DES**, **Triple DES**, **AES-192**, **CBC, CFB and ECB** generic over any
-block cipher, **RSA signing**, and libsodium's **XChaCha20 secretbox and box**
-with the **HChaCha20** underneath them.
+block cipher, **RSA signing**, libsodium's **XChaCha20 secretbox and box**
+with the **HChaCha20** underneath them, and the **CPace** PAKE.
 
 Named for what it is rather than for its first occupant — it started as
 `zig-des`, and DES is now the smaller half of it.
@@ -164,6 +164,7 @@ the numbers and the reasoning.
 | `rsa.SecretKey.Crt` | RFC 8017 §3.2's second representation — the two primes and the three values derived from them — kept when the key carried them, which every PKCS#1 and PKCS#8 key does. Signing then costs a quarter of what it otherwise would, and every signature is verified before release. |
 | `hChaCha20` | The key derivation `std.crypto` has and does not hand over: it is a private function inside the ChaCha implementation, reached only by `XChaCha20Poly1305`. libsodium's XChaCha20 box applies it a second time, to turn an X25519 shared point into the key the box is opened with, so a caller outside `std` needs it — DNSCrypt's es-version 2 is exactly that construction [14]. |
 | `XChaCha20SecretBox`, `XChaCha20Box` | libsodium's `crypto_secretbox_xchacha20poly1305` and `crypto_box_curve25519xchacha20poly1305`: the NaCl secretbox construction with XChaCha20 in it, tag first. `std` has the RFC 8439 AEAD of that name [15] and the NaCl secretbox over XSalsa20, and not this third combination — which is what DNSCrypt's es-version 2 uses [16], and produces different bytes from the AEAD under the same key and nonce. Every vector came from libsodium itself [17]. |
+| `CPace` | The balanced PAKE the CFRG recommends [18], in its CPACE-X25519-SHA512 suite and initiator-responder mode, with the draft's explicit key confirmation: two parties who share a PIN end with the same 64-byte key if and only if the PINs matched, and an attacker gets one guess a run. `std` has X25519 [19], the Elligator2 map, SHA-512 and HMAC, and not the protocol. The confirmation MAC, which the draft leaves open, is HMAC-SHA512 as the Python `cpace` package has it [20], because Sendspin pairs over that package. Checked against the draft's own vectors, fetched from the CFRG's repository for the tests, including its low-order and non-canonical points. |
 | `ff` | `std.crypto.ff` with one function put right — the only thing here that corrects the standard library rather than adding to it. See below. |
 
 ### The carried patch
@@ -453,6 +454,20 @@ $ nix develop -c zig build docs-serve   # http://127.0.0.1:8000
     <https://doc.libsodium.org/>. `crypto_secretbox_xchacha20poly1305_easy`
     and `crypto_box_curve25519xchacha20poly1305_beforenm`, called through
     `ctypes`, produced every number in `xchacha20_secretbox.zig`'s tests.
+18. Michel Abdalla, Björn Haase and Julia Hesse, *CPace, a balanced
+    composable PAKE*, Internet-Draft draft-irtf-cfrg-cpace-21, IRTF, April
+    2026, work in progress.
+    <https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/>. The protocol,
+    the X25519 suite and its key confirmation; its `testvectors.json` and
+    `testvectors.md`, from <https://github.com/cfrg/draft-irtf-cfrg-cpace>,
+    are what `tests/cpace.zig` checks against.
+19. Adam Langley, Mike Hamburg and Sean Turner, *Elliptic Curves for
+    Security*, RFC 7748, January 2016.
+    <https://www.rfc-editor.org/info/rfc7748>. X25519, and the clearing of
+    bit 255 that the draft's non-canonical points test.
+20. Artur Pragacz, *cpace* 0.1.0, a Python implementation of CPace.
+    <https://github.com/arturpragacz/cpace-py>. The confirmation tags for
+    the draft's inputs, which the draft does not give, came from it.
 
 ## Licence
 

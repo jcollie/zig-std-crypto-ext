@@ -8,15 +8,19 @@
     nixpkgs = {
       url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
     };
+    # The library still depends on nothing beyond `std`; the one entry in
+    # build.zig.zon is CPace's test vectors, which the tests -- and so the
+    # package's check phase -- need in a sandbox that cannot fetch them.
+    zon2nix = {
+      url = "github:jcollie/zon2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
-
-  # No `zon2nix` input, and no `build.zig.zon.nix`: this library has no
-  # dependencies beyond `std`, so there is nothing for a sandboxed build to
-  # fetch and nothing to generate. Add both back the day that changes.
 
   outputs =
     {
       nixpkgs,
+      zon2nix,
       ...
     }:
     let
@@ -27,6 +31,23 @@
           inherit system;
         };
       forAllSystems = lib.genAttrs lib.systems.flakeExposed;
+
+      # zon2nix shells out to `zig env`, and without a Zig on PATH it prints
+      # "unable to execute zig, is it in your PATH?" and stops having written
+      # nothing -- which leaves the previous build.zig.zon.nix in place looking
+      # untouched rather than obviously broken. Wrap it so the Zig it finds is
+      # this project's.
+      wrappedZon2nix =
+        pkgs:
+        pkgs.symlinkJoin {
+          name = "zon2nix";
+          paths = [ zon2nix.packages.${pkgs.stdenv.hostPlatform.system}.zon2nix ];
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          postBuild = ''
+            wrapProgram $out/bin/zon2nix \
+              --prefix PATH : ${lib.makeBinPath [ pkgs.zig_0_16 ]}
+          '';
+        };
 
       # The devshell's Zig, with one line of its own standard library put
       # right, because without it `zig build fuzz --fuzz` cannot compile.
@@ -116,6 +137,7 @@
             name = "zig-std-crypto-ext";
             nativeBuildInputs = [
               (fuzzableZig pkgs)
+              (wrappedZon2nix pkgs)
               pkgs.git-pages-cli
               pkgs.pinact
               pkgs.reuse

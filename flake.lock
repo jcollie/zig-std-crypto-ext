@@ -15,7 +15,28 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "zon2nix": "zon2nix"
+      }
+    },
+    "zon2nix": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1789872114,
+        "narHash": "sha256-yvn1xRRAR2IHuKqejmngftjBm/x/h/RspOg0ol4B5dw=",
+        "owner": "jcollie",
+        "repo": "zon2nix",
+        "rev": "723bddc9c51c5873965a17f922e4139d587764c1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jcollie",
+        "repo": "zon2nix",
+        "type": "github"
       }
     }
   },

@@ -601,6 +601,84 @@ const key_seeds = [_][]const u8{
 
 // -- the table the standalone driver reads ----------------------------------
 
+// -- CPace -----------------------------------------------------------------------
+
+/// Two runs from one input. The first byte splits the rest into a password,
+/// a session id and each side's associated data; the next 32 bytes are a
+/// share an attacker sends in place of the responder's.
+///
+/// An honest pair with the same password always agrees -- the same ISK, and
+/// each accepts the other's tag -- and with a password one bit different
+/// never does. And whatever share arrives, the initiator either refuses it as
+/// a point of low order or derives from it without crashing, and does not
+/// accept a tag it did not get from someone who knew the password: here, one
+/// the attacker could compute, its own run's.
+fn cpaceProperty(input: []const u8) !void {
+    if (input.len < 1 + 32) return;
+    const cut = input[0];
+    const forged: [32]u8 = input[1..33].*;
+    const rest = input[33..];
+    const a = @min(rest.len, cut & 0x1f);
+    const b = @min(rest.len - a, (cut >> 5) * 4);
+    const prs = rest[0..a];
+    const sid = rest[a..][0..b];
+    const ad = rest[a + b ..];
+
+    var prng: std.Random.DefaultPrng = .init(std.hash.Wyhash.hash(0, input));
+    const random = prng.random();
+
+    var init = try des.CPace.start(.initiator, prs, "", sid, ad, random);
+    var r = try des.CPace.start(.responder, prs, "", sid, "responder", random);
+    try init.derive(r.share, "responder");
+    try r.derive(init.share, ad);
+    try testing.expectEqualSlices(u8, &init.isk, &r.isk);
+    try testing.expect(init.verify(&r.tag()));
+    try testing.expect(r.verify(&init.tag()));
+
+    // One bit of the password different.
+    var wrong_buf: [32]u8 = @splat(0);
+    const wrong = wrong_buf[0..@max(prs.len, 1)];
+    if (prs.len > 0) @memcpy(wrong, prs);
+    wrong[0] ^= 1;
+    var w = try des.CPace.start(.responder, wrong, "", sid, "responder", random);
+    var init2 = try des.CPace.start(.initiator, prs, "", sid, ad, random);
+    try init2.derive(w.share, "responder");
+    try w.derive(init2.share, ad);
+    try testing.expect(!init2.verify(&w.tag()));
+    try testing.expect(!w.verify(&init2.tag()));
+
+    // An attacker's share, and the tag it could make: the one from a run of
+    // its own with a password it guessed.
+    var init3 = try des.CPace.start(.initiator, prs, "", sid, ad, random);
+    init3.derive(forged, "responder") catch |err| switch (err) {
+        error.IdentityElement => return,
+        error.AlreadyDerived => unreachable,
+    };
+    var guess = try des.CPace.start(.responder, wrong, "", sid, "responder", random);
+    try guess.derive(init3.share, ad);
+    try testing.expect(!init3.verify(&guess.tag()));
+}
+
+const cpace_seeds = [_][]const u8{
+    // Six-digit PINs with a session id and associated data, as a pairing
+    // would have them; the 32 bytes after the first are a forged share.
+    "\x46" ++ ("\x09" ** 32) ++ "123456" ++ "sid-sid-sid-sid-sid-sid-" ++ "server",
+    "\x08" ++ ("\x00" ** 32) ++ "12345678",
+    // The low-order points the draft lists, as the forged share.
+    "\x44" ++ "\x01" ++ ("\x00" ** 31) ++ "0000" ++ "s",
+    "\x44" ++ "\xec" ++ ("\xff" ** 30) ++ "\x7f" ++ "0000" ++ "s",
+};
+
+test "fuzz cpace" {
+    for (cpace_seeds) |seed| try cpaceProperty(seed);
+    try testing.fuzz({}, fuzzCpace, .{});
+}
+
+fn fuzzCpace(_: void, smith: *Smith) !void {
+    var buffer: [256]u8 = undefined;
+    try cpaceProperty(buffer[0..smith.slice(&buffer)]);
+}
+
 pub const Target = struct {
     name: []const u8,
     run: *const fn (input: []const u8) anyerror!void,
@@ -658,5 +736,11 @@ pub const all = [_]Target{
         .run = Driven(fuzzXbox).run,
         .corpus = &xbox_seeds,
         .content_max = 512,
+    },
+    .{
+        .name = "cpace",
+        .run = Driven(fuzzCpace).run,
+        .corpus = &cpace_seeds,
+        .content_max = 256,
     },
 };

@@ -3,7 +3,13 @@
     .version = "0.0.0",
     .fingerprint = 0xa03576c1e17069ce, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .cpace_draft = .{
+            .url = "git+https://github.com/cfrg/draft-irtf-cfrg-cpace#8fb4056e1b9201927d9f651b9970d9d5660c7892",
+            .hash = "N-V-__8AAM9FGQDkwJ56__CpfY0eUvYj5Qh4IBttCsz20Md7",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
