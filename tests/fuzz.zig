@@ -652,7 +652,7 @@ fn cpaceProperty(input: []const u8) !void {
     var init3 = try des.CPace.start(.initiator, prs, "", sid, ad, random);
     init3.derive(forged, "responder") catch |err| switch (err) {
         error.IdentityElement => return,
-        error.AlreadyDerived => unreachable,
+        error.AlreadyDerived, error.InputTooLong => unreachable,
     };
     var guess = try des.CPace.start(.responder, wrong, "", sid, "responder", random);
     try guess.derive(init3.share, ad);

@@ -20,6 +20,9 @@
 //! // a.isk == b.isk, and each accepts the other's tag.
 //! ```
 //!
+//! A run is a plain value that keeps copies of what it is given, so it can
+//! be moved and returned freely.
+//!
 //! The session id `sid` has to be unique to the run and known to both sides
 //! -- a protocol that runs CPace inside another handshake uses that
 //! handshake's hash. The channel identifier `ci` and each side's associated
@@ -48,8 +51,12 @@ pub const CPace = struct {
     /// The intermediate session key, once `derive` has run: the same on both
     /// sides if their passwords matched. Feed it to a KDF before using it.
     isk: [isk_length]u8 = undefined,
-    sid: []const u8,
-    ad: []const u8,
+    /// The session id and this side's associated data, copied: a run is a
+    /// value that can be moved and returned, so it keeps no pointers.
+    sid_buf: [max_input_length]u8,
+    sid_len: usize,
+    ad_buf: [max_input_length]u8,
+    ad_len: usize,
     scalar: [32]u8,
     state: enum { started, derived } = .started,
     own_tag: [tag_length]u8 = undefined,
@@ -60,6 +67,9 @@ pub const CPace = struct {
     sid_output: [64]u8 = undefined,
 
     pub const share_length = 32;
+    /// The longest session id and associated data a run keeps. The draft
+    /// sets no limit; real ones are a few dozen bytes.
+    pub const max_input_length = 256;
     pub const isk_length = Sha512.digest_length;
     pub const tag_length = HmacSha512.mac_length;
 
@@ -74,11 +84,12 @@ pub const CPace = struct {
         IdentityElement,
         /// `derive` called twice.
         AlreadyDerived,
+        /// A session id or associated data longer than `max_input_length`.
+        InputTooLong,
     };
 
     /// Begin a run: hash the password onto the curve and make this side's
-    /// share from a scalar drawn from `random`. `sid` and `ad` are borrowed,
-    /// and must outlive the run.
+    /// share from a scalar drawn from `random`. `sid` and `ad` are copied.
     pub fn start(role: Role, prs: []const u8, ci: []const u8, sid: []const u8, ad: []const u8, random: std.Random) Error!CPace {
         var scalar: [32]u8 = undefined;
         random.bytes(&scalar);
@@ -87,14 +98,20 @@ pub const CPace = struct {
 
     /// `start`, with the scalar given rather than drawn: for test vectors.
     pub fn startWithScalar(role: Role, prs: []const u8, ci: []const u8, sid: []const u8, ad: []const u8, scalar: [32]u8) Error!CPace {
+        if (sid.len > max_input_length or ad.len > max_input_length) return error.InputTooLong;
         const g = calculateGenerator(prs, ci, sid);
-        return .{
+        var self: CPace = .{
             .role = role,
             .share = try scalarMultVfy(scalar, g),
-            .sid = sid,
-            .ad = ad,
+            .sid_buf = undefined,
+            .sid_len = sid.len,
+            .ad_buf = undefined,
+            .ad_len = ad.len,
             .scalar = scalar,
         };
+        @memcpy(self.sid_buf[0..sid.len], sid);
+        @memcpy(self.ad_buf[0..ad.len], ad);
+        return self;
     }
 
     /// Take the peer's share and associated data, and derive `isk` and both
@@ -106,15 +123,17 @@ pub const CPace = struct {
         self.state = .derived;
         var k = try scalarMultVfy(self.scalar, peer_share);
         defer std.crypto.secureZero(u8, &k);
+        const sid = self.sid_buf[0..self.sid_len];
+        const ad = self.ad_buf[0..self.ad_len];
 
         const a_share, const a_ad, const b_share, const b_ad = switch (self.role) {
-            .initiator => .{ &self.share, self.ad, &peer_share, peer_ad },
-            .responder => .{ &peer_share, peer_ad, &self.share, self.ad },
+            .initiator => .{ &self.share, ad, &peer_share, peer_ad },
+            .responder => .{ &peer_share, peer_ad, &self.share, ad },
         };
 
         var h = Sha512.init(.{});
         lv(&h, dsi_isk);
-        lv(&h, self.sid);
+        lv(&h, sid);
         lv(&h, &k);
         transcript(&h, a_share, a_ad, b_share, b_ad);
         h.final(&self.isk);
@@ -123,7 +142,7 @@ pub const CPace = struct {
         defer std.crypto.secureZero(u8, &mac_key);
         h = Sha512.init(.{});
         h.update("CPaceMac");
-        h.update(self.sid);
+        h.update(sid);
         h.update(&self.isk);
         h.final(&mac_key);
 
@@ -283,4 +302,29 @@ test "a peer that sends back this side's own share is not confirmed" {
     const own = a.share;
     try a.derive(own, "");
     try testing.expect(!a.verify(&a.tag()));
+}
+
+test "a run is a value: moved or returned, it still agrees" {
+    const Start = struct {
+        fn run(role: CPace.Role, random: std.Random) !CPace {
+            // The session id and associated data here are gone once this
+            // returns, which a run that kept pointers to them would not
+            // survive.
+            var sid: [16]u8 = @splat(7);
+            var ad: [6]u8 = "client".*;
+            if (role == .initiator) ad = "server".*;
+            const c = try CPace.start(role, "4321", "", &sid, &ad, random);
+            @memset(&sid, 0xaa);
+            @memset(&ad, 0xaa);
+            return c;
+        }
+    };
+    var prng: std.Random.DefaultPrng = .init(5);
+    var a = try Start.run(.initiator, prng.random());
+    var b = try Start.run(.responder, prng.random());
+    try a.derive(b.share, "client");
+    try b.derive(a.share, "server");
+    try testing.expect(a.verify(&b.tag()) and b.verify(&a.tag()));
+    const long: [CPace.max_input_length + 1]u8 = @splat(0);
+    try testing.expectError(error.InputTooLong, CPace.start(.initiator, "", "", &long, "", prng.random()));
 }
