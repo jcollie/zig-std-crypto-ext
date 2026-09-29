@@ -8,7 +8,8 @@ SPDX-License-Identifier: MIT
 The ciphers, modes, signatures and constructions `std.crypto` leaves out:
 **DES**, **Triple DES**, **AES-192**, **CBC, CFB and ECB** generic over any
 block cipher, **RSA signing**, libsodium's **XChaCha20 secretbox and box**
-with the **HChaCha20** underneath them, and the **CPace** PAKE.
+with the **HChaCha20** underneath them, the **CPace** PAKE, and the
+password-hash primitives **MD4**, **crypt(3) DES** and **Argon2 version 1.0**.
 
 Named for what it is rather than for its first occupant — it started as
 `zig-des`, and DES is now the smaller half of it.
@@ -72,6 +73,13 @@ libsodium's `crypto_box_curve25519xchacha20poly1305` is, and the one DNSCrypt's
 es-version 2 is [16]. Those two constructions take the same key and the same
 nonce, are both called "XChaCha20-Poly1305", and produce different bytes, so
 reaching for the one in `std` yields a box no peer will open.
+
+**The password primitives are here because old password hashes outlive the
+systems that wrote them.** A password database is migrated rather than
+replaced, and a hash can only be upgraded when its user next logs in. So
+something has to verify the old ones in the meantime. The NT hash is MD4 [22],
+the traditional Unix `crypt` is a salted DES [21], and Argon2 hashes written
+before 2016 are version 1.0 [24]. `std` has none of the three.
 
 **RSA is here for a different reason, and it is not obsolete.** Zig 0.16 does
 ship RSA, but only half of it and only as an implementation detail of
@@ -165,6 +173,9 @@ the numbers and the reasoning.
 | `hChaCha20` | The key derivation `std.crypto` has and does not hand over: it is a private function inside the ChaCha implementation, reached only by `XChaCha20Poly1305`. libsodium's XChaCha20 box applies it a second time, to turn an X25519 shared point into the key the box is opened with, so a caller outside `std` needs it — DNSCrypt's es-version 2 is exactly that construction [14]. |
 | `XChaCha20SecretBox`, `XChaCha20Box` | libsodium's `crypto_secretbox_xchacha20poly1305` and `crypto_box_curve25519xchacha20poly1305`: the NaCl secretbox construction with XChaCha20 in it, tag first. `std` has the RFC 8439 AEAD of that name [15] and the NaCl secretbox over XSalsa20, and not this third combination — which is what DNSCrypt's es-version 2 uses [16], and produces different bytes from the AEAD under the same key and nonce. Every vector came from libsodium itself [17]. |
 | `CPace` | The balanced PAKE the CFRG recommends [18], in its CPACE-X25519-SHA512 suite and initiator-responder mode, with the draft's explicit key confirmation: two parties who share a PIN end with the same 64-byte key if and only if the PINs matched, and an attacker gets one guess a run. `std` has X25519 [19], the Elligator2 map, SHA-512 and HMAC, and not the protocol. The confirmation MAC, which the draft leaves open, is HMAC-SHA512 as the Python `cpace` package has it [20], because Sendspin pairs over that package. Checked against the draft's own vectors, fetched from the CFRG's repository for the tests, including its low-order and non-canonical points. |
+| `crypt3` | The DES inside the traditional Unix `crypt(3)`: DES with its expansion E perturbed by a 12- or 24-bit salt, applied a given number of times. It is not DES, and a `crypt` built from `Des` produces hashes no Unix can read [21]. The key packing, the zero block, the 25 passes and crypt's own base64 belong to the caller, because `crypt`, `bigcrypt`, `crypt16` and BSDi's `_` format each do them differently. The salt is applied by masks, so the timing is `Des`'s. |
+| `Md4` | RFC 1320 MD4 [22], in `std.crypto.hash.Md5`'s shape so that `Hmac(Md4)` works. MD4 is broken far worse than MD5. It is here because the NT password hash is MD4 over UTF-16LE, and so are the Windows cached domain credentials. |
+| `argon2.kdf` | Argon2d, Argon2i and Argon2id at **version 1.0 or 1.3**. `std.crypto.pwhash.argon2` computes only 1.3 [23]. Version 1.0 hashes, written by the reference implementation before 2016 [24], cannot be checked without it. It is `std`'s kdf vendored, with the version as a parameter, and it takes `std`'s own `Params` and `Mode`. |
 | `ff` | `std.crypto.ff` with one function put right — the only thing here that corrects the standard library rather than adding to it. See below. |
 
 ### The carried patch
@@ -468,6 +479,23 @@ $ nix develop -c zig build docs-serve   # http://127.0.0.1:8000
 20. Artur Pragacz, *cpace* 0.1.0, a Python implementation of CPace.
     <https://github.com/arturpragacz/cpace-py>. The confirmation tags for
     the draft's inputs, which the draft does not give, came from it.
+
+21. Robert Morris and Ken Thompson, "Password Security: A Case History",
+    *Communications of the ACM* 22(11), pp. 594–597, November 1979.
+    <https://doi.org/10.1145/359168.359172>. The salted DES of `crypt(3)`,
+    and why the salt perturbs E rather than being mixed into the key. The
+    vectors are from passlib 1.9.3's pure-Python `des_encrypt_int_block`.
+22. Ronald L. Rivest, *The MD4 Message-Digest Algorithm*, RFC 1320, April
+    1992. <https://www.rfc-editor.org/info/rfc1320>. The algorithm and the
+    A.5 test suite; the other MD4 answers came from OpenSSL [13].
+23. Alex Biryukov, Daniel Dinu, Dmitry Khovratovich and Simon Josefsson,
+    *Argon2 Memory-Hard Function for Password Hashing and Proof-of-Work
+    Applications*, RFC 9106, September 2021.
+    <https://www.rfc-editor.org/info/rfc9106>. Version 1.3.
+24. Alex Biryukov, Daniel Dinu and Dmitry Khovratovich, *Argon2 reference
+    implementation*, through argon2-cffi 25.1.0.
+    <https://github.com/P-H-C/phc-winner-argon2>. Both versions; every
+    Argon2 vector in `argon2.zig` came from it.
 
 ## Licence
 

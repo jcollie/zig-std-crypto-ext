@@ -599,6 +599,106 @@ const key_seeds = [_][]const u8{
     &oversized_public_key_der,
 };
 
+// -- the password primitives ---------------------------------------------------
+//
+// MD4, crypt(3) DES and versioned Argon2 exist for password hashing, and each
+// has a property that a test vector only samples: MD4 has to give the same
+// answer however its input is split across `update` calls, crypt3 has to
+// compose (n passes then m passes is n + m passes) and be DES when unsalted,
+// and Argon2 at version 1.3 has to be `std`'s Argon2.
+
+fn md4Property(input: []const u8) !void {
+    var whole: [des.Md4.digest_length]u8 = undefined;
+    des.Md4.hash(input, &whole, .{});
+    // Three pieces, cut where the first two bytes say, so the cuts fall on
+    // and off the block boundaries as the input pleases.
+    const a = if (input.len == 0) 0 else input[0] % (input.len + 1);
+    const b = if (input.len < 2) a else a + input[1] % (input.len - a + 1);
+    var h = des.Md4.init(.{});
+    h.update(input[0..a]);
+    h.update(input[a..b]);
+    h.update(input[b..]);
+    var pieces: [des.Md4.digest_length]u8 = undefined;
+    h.final(&pieces);
+    try testing.expectEqualSlices(u8, &whole, &pieces);
+}
+
+test "fuzz md4" {
+    for (cipher_seeds) |seed| try md4Property(seed);
+    try testing.fuzz({}, fuzzMd4, .{});
+}
+
+fn fuzzMd4(_: void, smith: *Smith) !void {
+    var buffer: [1024]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try md4Property(buffer[0..len]);
+}
+
+fn crypt3Property(input: []const u8) !void {
+    if (input.len < 8 + 8 + 3 + 2) return;
+    const key = input[0..8].*;
+    const block = std.mem.readInt(u64, input[8..16], .big);
+    const salt = std.mem.readInt(u24, input[16..19], .little);
+    // Small counts: the property is about composition, not about stamina.
+    const n: u32 = input[19] % 8;
+    const m: u32 = input[20] % 8;
+
+    const split = des.crypt3(key, salt, m, des.crypt3(key, salt, n, block));
+    try testing.expectEqual(des.crypt3(key, salt, n + m, block), split);
+
+    // Unsalted, one pass is DES itself.
+    var in: [8]u8 = undefined;
+    std.mem.writeInt(u64, &in, block, .big);
+    var out: [8]u8 = undefined;
+    Des.initEnc(key).encrypt(&out, &in);
+    try testing.expectEqual(std.mem.readInt(u64, &out, .big), des.crypt3(key, 0, 1, block));
+}
+
+test "fuzz crypt3" {
+    for (cipher_seeds) |seed| try crypt3Property(seed);
+    try testing.fuzz({}, fuzzCrypt3, .{});
+}
+
+fn fuzzCrypt3(_: void, smith: *Smith) !void {
+    var buffer: [64]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try crypt3Property(buffer[0..len]);
+}
+
+fn argon2Property(input: []const u8) !void {
+    if (input.len < 3 + 8) return;
+    const argon2 = des.argon2;
+    const mode: argon2.Mode = switch (input[0] % 3) {
+        0 => .argon2d,
+        1 => .argon2i,
+        else => .argon2id,
+    };
+    // One lane keeps it off the `Io`, which the standalone driver has none
+    // of; the lanes are the reference vectors' business.
+    const params: argon2.Params = .{ .t = 1 + input[1] % 3, .m = 8 + input[2] % 32, .p = 1 };
+    const rest = input[3..];
+    const salt_len = 8 + rest[0] % @min(rest.len - 7, 24);
+    const salt = rest[0..salt_len];
+    const password = rest[salt_len..];
+
+    var ours: [32]u8 = undefined;
+    var theirs: [32]u8 = undefined;
+    try argon2.kdf(backing, &ours, password, salt, params, mode, .v0x13, std.Io.failing);
+    try std.crypto.pwhash.argon2.kdf(backing, &theirs, password, salt, params, mode, std.Io.failing);
+    try testing.expectEqualSlices(u8, &theirs, &ours);
+}
+
+test "fuzz argon2" {
+    for (cipher_seeds) |seed| try argon2Property(seed);
+    try testing.fuzz({}, fuzzArgon2, .{});
+}
+
+fn fuzzArgon2(_: void, smith: *Smith) !void {
+    var buffer: [128]u8 = undefined;
+    const len = smith.slice(&buffer);
+    try argon2Property(buffer[0..len]);
+}
+
 // -- the table the standalone driver reads ----------------------------------
 
 // -- CPace -----------------------------------------------------------------------
@@ -736,6 +836,24 @@ pub const all = [_]Target{
         .run = Driven(fuzzXbox).run,
         .corpus = &xbox_seeds,
         .content_max = 512,
+    },
+    .{
+        .name = "md4",
+        .run = Driven(fuzzMd4).run,
+        .corpus = &cipher_seeds,
+        .content_max = 1024,
+    },
+    .{
+        .name = "crypt3",
+        .run = Driven(fuzzCrypt3).run,
+        .corpus = &cipher_seeds,
+        .content_max = 64,
+    },
+    .{
+        .name = "argon2",
+        .run = Driven(fuzzArgon2).run,
+        .corpus = &cipher_seeds,
+        .content_max = 128,
     },
     .{
         .name = "cpace",

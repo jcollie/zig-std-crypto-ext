@@ -25,6 +25,11 @@
 //! is the second one, so it is here, along with the HChaCha20 both of them are
 //! built on.
 //!
+//! And a fourth: the primitives old password hashes are built on. `Md4` is
+//! under the NT hash, `crypt3` is the salted DES of the traditional Unix
+//! `crypt`, and `argon2` computes Argon2 at version 1.0 as well as the 1.3
+//! that `std` has.
+//!
 //! Named for what it is rather than for its first occupant: it started as
 //! `zig-des` and DES is now the smaller half of it.
 //!
@@ -73,6 +78,8 @@ const testing = std.testing;
 /// this module as `des` does not have to write `des.des.Des`.
 pub const cipher = @import("des.zig");
 pub const modes = @import("modes.zig");
+pub const md4 = @import("md4.zig");
+pub const argon2 = @import("argon2.zig");
 /// AES-192, which `std.crypto` omits: it ships Aes128 and Aes256 and nothing
 /// between. Encryption only, because CFB and CTR never run a cipher
 /// backwards -- the file says more.
@@ -119,6 +126,8 @@ pub const ff = @import("ff.zig");
 pub const Des = cipher.Des;
 pub const CPace = cpace.CPace;
 pub const Des3 = cipher.Des3;
+pub const crypt3 = cipher.crypt3;
+pub const Md4 = md4.Md4;
 pub const Aes192 = aes192.Aes192;
 pub const hChaCha20 = hchacha20.hChaCha20;
 pub const XChaCha20SecretBox = xchacha20_secretbox.SecretBox;
@@ -135,6 +144,8 @@ test {
     // only through a reference to it.
     _ = cipher;
     _ = modes;
+    _ = md4;
+    _ = argon2;
     _ = aes192;
     _ = rsa;
     _ = hchacha20;

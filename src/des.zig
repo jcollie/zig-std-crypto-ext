@@ -365,8 +365,17 @@ inline fn sbox(comptime box: usize, six: u6) u4 {
 }
 
 /// The Feistel round function: expand, mix in the key, substitute, permute.
-fn feistel(right: u32, round_key: u48) u32 {
-    const expanded = permute(48, 32, &expansion, right) ^ @as(u64, round_key);
+///
+/// `salt` is crypt(3)'s perturbation of E, and zero for DES itself: each set
+/// bit `k` of it exchanges outputs `k` and `k + 24` of the expansion, counting
+/// from the top. Those two sit at the same position in the upper and lower
+/// halves of the 48 bits, so the exchange is the usual masked swap, done
+/// before the round key is mixed in, as the table swap in V7 `crypt.c` does.
+fn feistel(right: u32, round_key: u48, salt: u24) u32 {
+    var expanded = permute(48, 32, &expansion, right);
+    const swap = ((expanded >> 24) ^ expanded) & @bitReverse(salt);
+    expanded ^= swap | (swap << 24);
+    expanded ^= @as(u64, round_key);
     var substituted: u32 = 0;
     inline for (0..8) |box| {
         // Six bits at a time, most significant group first.
@@ -380,11 +389,16 @@ fn feistel(right: u32, round_key: u48) u32 {
 /// given -- which is the whole of the difference between encrypting and
 /// decrypting a Feistel cipher.
 fn crypt(keys: *const [16]u48, block: u64) u64 {
+    return cryptSalted(keys, block, 0);
+}
+
+/// `crypt` with E perturbed by `salt`; see `feistel`.
+fn cryptSalted(keys: *const [16]u48, block: u64, salt: u24) u64 {
     const permuted = permute(64, 64, &initial_permutation, block);
     var left: u32 = @truncate(permuted >> 32);
     var right: u32 = @truncate(permuted);
     for (keys) |round_key| {
-        const next = left ^ feistel(right, round_key);
+        const next = left ^ feistel(right, round_key, salt);
         left = right;
         right = next;
     }
@@ -529,6 +543,37 @@ pub const Des3 = struct {
         }
     };
 };
+
+/// The DES at the heart of the traditional Unix `crypt(3)`: `block`
+/// encrypted `count` times over under `key`, with the expansion E perturbed
+/// by `salt`.
+///
+/// This is not DES, and a `crypt` built from `Des` produces nothing any Unix
+/// can read. The salt exists so that one precomputed table of DES encryptions
+/// could not attack every password at once. Each set bit `k` of it, counted
+/// from the least significant, exchanges outputs `k` and `k + 24` of E, which
+/// makes 4096 different ciphers of the traditional 12-bit salt. BSDi's
+/// extended format uses all 24 bits the same way.
+///
+/// Everything else is the caller's, because it differs between the formats:
+///
+/// * The traditional `crypt` takes the first eight characters of the
+///   password, each shifted left one bit so that its seven bits land where
+///   PC-1 reads them, encrypts a zero block 25 times, and prints the result
+///   in its own base64. `bigcrypt` and `crypt16` chain further blocks.
+/// * BSDi's `_` format folds a longer password into the key with ordinary DES
+///   (a `salt` of zero, which this also accepts), and takes `count` from the
+///   hash, where it can be anything up to 2^24 - 1.
+///
+/// A `count` of zero returns `block` unchanged. The time taken depends on
+/// `count` and on nothing else, since the salt is applied by masks.
+pub fn crypt3(key: [8]u8, salt: u24, count: u32, block: u64) u64 {
+    var keys = schedule(key);
+    defer std.crypto.secureZero(u48, &keys);
+    var out = block;
+    for (0..count) |_| out = cryptSalted(&keys, out, salt);
+    return out;
+}
 
 /// Whether every byte of `key` has odd parity, which is the convention DES
 /// keys are distributed under.
@@ -784,4 +829,47 @@ test "IP^-1 undoes IP on live data" {
         const there = permute(64, 64, &initial_permutation, block);
         try testing.expectEqual(block, permute(64, 64, &final_permutation, there));
     }
+}
+
+test "crypt3 with no salt and one pass is DES" {
+    const key = [_]u8{ 0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1 };
+    try testing.expectEqual(@as(u64, 0x85e813540f0ab405), crypt3(key, 0, 1, 0x0123456789abcdef));
+    try testing.expectEqual(@as(u64, 0x0123456789abcdef), crypt3(key, 0, 0, 0x0123456789abcdef));
+}
+
+test "crypt3 against passlib's des_encrypt_int_block" {
+    // The FIPS key and block under a spread of salts, from the pure-Python DES
+    // in passlib 1.9.3: `des_encrypt_int_block(key, block, salt, count)`. The
+    // single bits at each end of the 12- and 24-bit ranges pin which output of
+    // E each salt bit swaps; a salt applied bit-reversed still round-trips and
+    // still looks like a cipher.
+    const key = [_]u8{ 0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1 };
+    const cases = [_]struct { salt: u24, count: u32, out: u64 }{
+        .{ .salt = 0x000000, .count = 25, .out = 0x02279236c9bb3793 },
+        .{ .salt = 0x000001, .count = 1, .out = 0x5df14ffcf84d3dc9 },
+        .{ .salt = 0x000001, .count = 25, .out = 0x0336689f391fda45 },
+        .{ .salt = 0x000800, .count = 1, .out = 0xac81480b09967ec2 },
+        .{ .salt = 0x000800, .count = 25, .out = 0xd03cfb2b55e3981b },
+        .{ .salt = 0x000abc, .count = 1, .out = 0xd720aee46dd417c4 },
+        .{ .salt = 0x000abc, .count = 25, .out = 0x06d7cd5c01e46ff4 },
+        .{ .salt = 0x000fff, .count = 1, .out = 0x1357125b2162de7a },
+        .{ .salt = 0x000fff, .count = 25, .out = 0x295dae342dc20dd2 },
+        .{ .salt = 0x123456, .count = 1, .out = 0xe82cb2072a775355 },
+        .{ .salt = 0x123456, .count = 25, .out = 0xd1a07bfd56bfdde8 },
+        .{ .salt = 0xffffff, .count = 1, .out = 0x721e032d0f5ae4b5 },
+        .{ .salt = 0xffffff, .count = 25, .out = 0xc2188f3ea90d74ec },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.out, crypt3(key, c.salt, c.count, 0x0123456789abcdef));
+    }
+}
+
+test "crypt3 is the traditional crypt of \"password\" with salt \"ab\"" {
+    // crypt("password", "ab") is "abJnggxhB/yWI" on every Unix that still has
+    // DES crypt. The key is each character shifted left one bit, the salt "ab"
+    // is 38 + 39 * 64 in crypt's alphabet, and the 64 bits below are what
+    // "JnggxhB/yWI" decodes to.
+    var key: [8]u8 = undefined;
+    for (&key, "password") |*k, c| k.* = c << 1;
+    try testing.expectEqual(@as(u64, 0x573b2cf6d341fa25), crypt3(key, 0x9e6, 25, 0));
 }
