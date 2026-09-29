@@ -523,7 +523,21 @@ pub const SecretKey = struct {
         return fromDer(der_bytes);
     }
 
-    fn fromComponents(
+    /// A secret key from its three numbers: the modulus `n`, the public
+    /// exponent `e` and the private exponent `d`, each big-endian and
+    /// unsigned. `e` is held to the four bytes `PublicKey.fromBytes` allows,
+    /// leading zeros included; `n` and `d` may carry any.
+    ///
+    /// For formats that carry a key as bare integers rather than as DER. An
+    /// OpenPGP RSA secret key is one: RFC 9580 section 5.5.5.1 stores `n` and
+    /// `e`, then `d`, `p`, `q` and `u = p^-1 mod q` -- but not `d mod (p-1)`
+    /// or `d mod (q-1)`, and those cannot be computed here, because
+    /// `std.crypto.ff` does Montgomery arithmetic, which needs an odd modulus,
+    /// and `p - 1` is even. So the key this returns has no second
+    /// representation and signs the whole-`d` way: about four times slower
+    /// than the CRT, which is still about a tenth of a second for a 4096-bit
+    /// key. Every signature is verified before release either way.
+    pub fn fromComponents(
         modulus: []const u8,
         public_exponent: []const u8,
         private_exponent: []const u8,
@@ -1299,6 +1313,42 @@ test "the two representations sign identically" {
     const with = try pkcs1v1_5.Signer(Sha256).sign(&a, test_message, sk);
     const without = try pkcs1v1_5.Signer(Sha256).sign(&b, test_message, whole);
     try testing.expectEqualSlices(u8, without, with);
+}
+
+test "a key built from n, e and d signs as the DER it came from does" {
+    // What `fromComponents` is for: a format that hands over bare integers.
+    // The numbers are read back out of a key that was parsed from DER, so
+    // the two must sign identically, and neither has the CRT to lean on.
+    var der_buf: [max_secret_key_der]u8 = undefined;
+    const sk = try SecretKey.fromPem(&der_buf, key_2048_pkcs8);
+    const k = sk.modulusLength();
+
+    var n_bytes: [max_modulus_len]u8 = undefined;
+    var e_bytes: [max_modulus_len]u8 = undefined;
+    var d_bytes: [max_modulus_len]u8 = undefined;
+    try sk.n.toBytes(n_bytes[0..k], .big);
+    try sk.e.toBytes(e_bytes[0..k], .big);
+    try sk.d.toBytes(d_bytes[0..k], .big);
+
+    // `d` keeps its leading zeros, if it has any, at the full width of the
+    // modulus; `e` has to lose them, since a public exponent is refused at
+    // more than four bytes.
+    const e_trimmed = std.mem.trimStart(u8, e_bytes[0..k], &.{0});
+    const rebuilt = try SecretKey.fromComponents(n_bytes[0..k], e_trimmed, d_bytes[0..k]);
+    try testing.expect(rebuilt.crt == null);
+
+    var a: [max_modulus_len]u8 = undefined;
+    var b: [max_modulus_len]u8 = undefined;
+    const want = try pkcs1v1_5.Signer(Sha256).sign(&a, test_message, sk);
+    const got = try pkcs1v1_5.Signer(Sha256).sign(&b, test_message, rebuilt);
+    try testing.expectEqualSlices(u8, want, got);
+
+    // And a `d` of zero is not a key.
+    @memset(d_bytes[0..k], 0);
+    try testing.expectError(
+        error.InvalidKey,
+        SecretKey.fromComponents(n_bytes[0..k], e_trimmed, d_bytes[0..k]),
+    );
 }
 
 test "a key whose components contradict each other signs nothing" {
