@@ -178,11 +178,30 @@ the numbers and the reasoning.
 | `argon2.kdf` | Argon2d, Argon2i and Argon2id at **version 1.0 or 1.3**. `std.crypto.pwhash.argon2` computes only 1.3 [23]. Version 1.0 hashes, written by the reference implementation before 2016 [24], cannot be checked without it. It is `std`'s kdf vendored, with the version as a parameter, and it takes `std`'s own `Params` and `Mode`. |
 | `ff` | `std.crypto.ff` with one function put right — the only thing here that corrects the standard library rather than adding to it. See below. |
 
-### The carried patch
+### The carried patches
 
 `ff` is not an addition. It is `std.crypto.ff` vendored from Zig 0.17.0 with
-one function changed, and the intent is that the change goes upstream and the
-file then goes away.
+two changes, and the intent is that both go upstream and the file then goes
+away.
+
+**A branch on every nibble of the secret exponent.** The constant-time
+selects that `ff` is built on mask with a value computed from a `bool`, and
+LLVM can see through it: it hoists the condition out of `cmov`'s loop over
+the limbs and branches around the copy instead. So the window-table lookup
+and the conditional multiply in the secret-exponent ladder branch on each
+nibble of the exponent, which is the thing `powWithEncodedExponent` exists to
+keep secret, and RSA signing here goes through exactly that path. The fix is
+to pass the mask through an empty `asm` statement the optimizer cannot see
+into. It is Zig issue #37023 [25], and this is the same change as the pull
+request that fixes it [26].
+
+It shows two ways. Welch's t between a fixed and a random three-byte secret
+exponent, from `zig build timing`, is 20 to 60 without the barrier and about
+2 with it, where ten is the threshold at which the harness calls a leak; the
+barrier costs about 8% of an exponentiation. And with the exponent marked
+undefined, Valgrind's memcheck reports branches on it inside `cmov`, reached
+from both the table lookup and the multiply, without the barrier and none with
+it.
 
 **Half the squarings, spent on leading zeros.** `Modulus.pow` serializes the secret exponent before handing it to the
 exponentiation ladder, and it sizes that buffer by `Fe.encoded_bytes` — the
@@ -229,7 +248,9 @@ the path that branches on the secret. 0.17.0 parenthesises it, and
 method as everything else in that harness: Welch's t between a fixed and a
 random three-byte secret exponent is about 2400 with the 0.16.0 test and about
 1 with the parentheses, where ten is the threshold at which the harness calls
-a leak.
+a leak. The same measurement is what found the branch described above, which
+Zig 0.17.0's code generation exposed: it is the reason the harness measures
+the compiled code and not the source.
 
 The fixed class in that measurement is an ordinary three-byte exponent rather
 than zeros, and that is not a detail. Zeros make it the exponent 1, which is
@@ -494,6 +515,15 @@ $ nix develop -c zig build docs-serve   # http://127.0.0.1:8000
     implementation*, through argon2-cffi 25.1.0.
     <https://github.com/P-H-C/phc-winner-argon2>. Both versions; every
     Argon2 vector in `argon2.zig` came from it.
+25. MartinMolnar, *std.crypto.ff: powWithEncodedExponent branches on the
+    secret exponent (constant-time select/eql compiled to jumps)*, Zig issue
+    #37023, 30 September 2026.
+    <https://codeberg.org/ziglang/zig/issues/37023>. Found with valgrind's
+    memcheck, the exponent marked undefined; the same method confirmed it here.
+26. Frank Denis, *crypto.ff: hide constant-time selection masks from
+    optimizer*, Zig pull request #37025, 30 September 2026.
+    <https://codeberg.org/ziglang/zig/pulls/37025>. The value barrier
+    `src/ff.zig` carries.
 
 ## Licence
 

@@ -82,10 +82,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const crypto = std.crypto;
 /// This library's `ff` and not `std.crypto.ff`, which is the same file with
-/// one thing put right: `pow` sizing its exponent buffer by the type's width
-/// rather than the modulus's. It is not reachable from the code here --
-/// which is why it was only found by measuring something else -- but a
-/// library that carries the fix should be the first to use it.
+/// two things put right. One matters here: compiled by LLVM, `std`'s
+/// constant-time selects branch on the secret exponent, and the private
+/// exponentiation below goes through exactly those. The other, `pow` sizing
+/// its exponent buffer by the type's width rather than the modulus's, is not
+/// reachable from the code here, but a library that carries the fix should
+/// be the first to use it.
 const ff = @import("ff.zig");
 const testing = std.testing;
 

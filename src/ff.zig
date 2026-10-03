@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
 // SPDX-License-Identifier: MIT
 //
-// Vendored from Zig 0.17.0's `lib/std/crypto/ff.zig` and changed in one
-// place. See the note below, and `README.md` for the measurements.
+// Vendored from Zig 0.17.0's `lib/std/crypto/ff.zig` and changed in two
+// places. See the note below, and `README.md` for the measurements.
 
 //! Allocation-free, (best-effort) constant-time, finite field arithmetic for large integers.
 //!
@@ -16,8 +16,30 @@
 //!
 //! ## What is changed from the standard library
 //!
-//! One function: `Modulus.pow`, which serializes the secret exponent before
-//! handing it to the ladder. It sizes that buffer by `Fe.encoded_bytes` --
+//! Two things: a branch on the secret exponent that the optimizer puts back
+//! into the constant-time selects, and half the work of every RSA signature.
+//!
+//! ### A branch on every nibble of the secret exponent
+//!
+//! `ct_protected.select` builds its mask from a `bool` the optimizer can see
+//! through. LLVM hoists that loop-invariant condition out of `cmov`'s
+//! per-limb loop and turns it into a branch around the copy, so the
+//! window-table lookup and the conditional multiply in
+//! `powWithEncodedExponentInternal` branch on each nibble of the exponent.
+//! An empty `asm` statement that the mask passes through hides it from the
+//! optimizer, which is the whole fix. It is ziglang/zig#37023, fixed the same
+//! way by ziglang/zig#37025.
+//!
+//! `zig build timing` measures it: under Zig 0.17.0 in ReleaseFast, Welch's t
+//! between a fixed and a random three-byte secret exponent is 20 to 60
+//! without the barrier and about 2 with it, where ten is already a leak.
+//! Valgrind's memcheck with the exponent marked undefined agrees, reporting
+//! branches on it in `cmov` without the barrier and none with it.
+//!
+//! ### Half the squarings, on leading zeros
+//!
+//! `Modulus.pow` serializes the secret exponent before handing it to the
+//! ladder. It sizes that buffer by `Fe.encoded_bytes` --
 //! the *type's* maximum width -- where it should use the modulus's own. The
 //! ladder spends four squarings on every nibble it is given, so the
 //! difference between the two is squarings of leading zeros, and the cost is
@@ -42,7 +64,7 @@
 //! `tests/ff.zig` checks the two implementations agree, across the widths
 //! where they differ and the widths where they should not.
 //!
-//! This is a carried patch and not a fork: the intent is that it goes
+//! These are carried patches and not a fork: the intent is that both go
 //! upstream and this file then goes away.
 
 const std = @import("std");
@@ -1135,12 +1157,25 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
     };
 }
 
+// Hides `x` from the optimizer, so that it cannot reason about where it came
+// from. Without it LLVM sees that `select`'s mask is all ones or all zeros,
+// hoists the condition out of `cmov`'s loop over the limbs, and branches on
+// it -- on the secret exponent, in `powWithEncodedExponentInternal`. The C
+// backend has no inline assembly and comptime needs none.
+fn valueBarrier(x: Limb) Limb {
+    if (@inComptime() or builtin.zig_backend == .stage2_c) return x;
+    return asm (""
+        : [ret] "=r" (-> Limb),
+        : [x] "0" (x),
+    );
+}
+
 const ct = if (std.options.side_channels_mitigations == .none) ct_unprotected else ct_protected;
 
 const ct_protected = struct {
     // Returns x if on is true, otherwise y.
     fn select(on: bool, x: Limb, y: Limb) Limb {
-        const mask = @as(Limb, 0) -% @intFromBool(on);
+        const mask = valueBarrier(@as(Limb, 0) -% @intFromBool(on));
         return y ^ (mask & (y ^ x));
     }
 
