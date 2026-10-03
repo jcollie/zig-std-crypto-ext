@@ -289,7 +289,7 @@ fn parityOp(input: *const Input) u64 {
 ///
 /// `std.crypto.ff` chooses between a constant-time table walk and a short
 /// exponent loop with a data-dependent branch, and in 0.16.0 the test that
-/// makes that choice reads
+/// makes that choice read
 ///
 /// ```zig
 /// if (public and e.len < 3 or (e.len == 3 and e[0] <= 0b1111))
@@ -297,9 +297,10 @@ fn parityOp(input: *const Input) u64 {
 ///
 /// which `and` binding tighter than `or` turns into `(public and short) or
 /// (three bytes and small)`. The second half never asks whether the exponent
-/// is public, so a three-byte secret exponent with a small top nibble goes
-/// down the branchy path and its bits show up in the timing. `src/ff.zig`
-/// parenthesises it; this is what says so.
+/// is public, so a three-byte secret exponent with a small top nibble went
+/// down the branchy path and its bits showed up in the timing. `src/ff.zig`
+/// carried the parentheses as a patch until Zig 0.17.0 added them upstream;
+/// this keeps checking that they stay.
 ///
 /// Fixed class: an exponent of three zero-ish bytes. Random class: three
 /// random bytes under the same top-nibble bound, so both classes take the

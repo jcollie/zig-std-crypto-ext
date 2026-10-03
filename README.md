@@ -180,50 +180,17 @@ the numbers and the reasoning.
 
 ### The carried patch
 
-`ff` is not an addition. It is `std.crypto.ff` vendored from Zig 0.16.0 with
-two functions changed, and the intent is that both go upstream and the file
-then goes away.
-
-**A secret exponent taking the branchy path.**
-`powWithEncodedExponentInternal` chooses between a constant-time walk over a
-precomputation table and a short-exponent loop that branches on the
-exponent's bits, and the test that chooses reads `public and e.len < 3 or
-(e.len == 3 and ...)`. Since `and` binds tighter than `or`, that means
-`(public and short) or (three bytes and small)` — and the second half never
-asks whether the exponent is public. A three-byte *secret* exponent with a
-small top nibble goes down the path that branches on the secret.
-
-`zig build timing` measures it rather than asserting it, by the same dudect
-method as everything else in that harness. Welch's t between a fixed and a
-random three-byte secret exponent:
-
-| | t |
-| --- | --- |
-| upstream | ~2400 |
-| here | ~1 |
-
-Ten is the threshold at which the harness calls a leak. The means go from
-530,000 cycles against 710,000 — the classes plainly doing different amounts
-of work — to the same number either way.
-
-The fixed class in that measurement is an ordinary three-byte exponent rather
-than zeros, and that is not a detail. Zeros make it the exponent 1, which is
-degenerate: nearly every step of the ladder is then multiplying by one, and
-the test ends up comparing a trivial exponentiation with a normal one rather
-than one secret with another. Written that way it reports single digits at a
-hundred thousand samples and a leak at a million and a half, which is the
-test's doing and not the code's. Whether it is reachable depends on
-the caller: an RSA key with a three-byte private exponent is broken for other
-reasons, but `ff` is general, and a protocol using short secret exponents on
-purpose would leak them.
+`ff` is not an addition. It is `std.crypto.ff` vendored from Zig 0.17.0 with
+one function changed, and the intent is that the change goes upstream and the
+file then goes away.
 
 **Half the squarings, spent on leading zeros.** `Modulus.pow` serializes the secret exponent before handing it to the
-exponentiation ladder, and it sized that buffer by `Fe.encoded_bytes` — the
+exponentiation ladder, and it sizes that buffer by `Fe.encoded_bytes` — the
 *type's* maximum width — rather than by the modulus's own. The ladder spends
 four squarings on every nibble it is given, so the difference between the two
 is squarings of leading zeros, and the cost is linear in how far the type
 overshoots the key. An RSA implementation that supports 4096-bit keys
-instantiates `Modulus(4096)` for all of them, so every 2048-bit key paid
+instantiates `Modulus(4096)` for all of them, so every 2048-bit key pays
 twice. One private exponentiation, ReleaseFast:
 
 | | `std.crypto.ff` | `ff` here |
@@ -249,9 +216,26 @@ through both implementations, at the widths where the patch changes the work
 and at the widths where it must not. The second set is not ceremony — sizing
 the exponent by the limb count rather than the bit length asks for more bytes
 than the buffer has when the modulus fills the type, and that is how the first
-version of the patch was caught. The timing change is checked by
-`zig build timing`, which is the only way to check it: both versions compute
-the same answer, and the difference between them is a clock.
+version of the patch was caught.
+
+**A secret exponent and the branchy path.** `powWithEncodedExponentInternal`
+chooses between a constant-time walk over a precomputation table and a
+short-exponent loop that branches on the exponent's bits. In Zig 0.16.0 the
+test that chooses read `public and e.len < 3 or (e.len == 3 and ...)`, which
+`and` binding tighter than `or` turns into `(public and short) or (three bytes
+and small)`, so a three-byte *secret* exponent with a small top nibble took
+the path that branches on the secret. 0.17.0 parenthesises it, and
+`zig build timing` keeps checking that it stays that way, by the same dudect
+method as everything else in that harness: Welch's t between a fixed and a
+random three-byte secret exponent is about 2400 with the 0.16.0 test and about
+1 with the parentheses, where ten is the threshold at which the harness calls
+a leak.
+
+The fixed class in that measurement is an ordinary three-byte exponent rather
+than zeros, and that is not a detail. Zeros make it the exponent 1, which is
+degenerate: nearly every step of the ladder is then multiplying by one, and
+the test ends up comparing a trivial exponentiation with a normal one rather
+than one secret with another.
 
 ## Using it
 

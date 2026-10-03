@@ -3,7 +3,7 @@
 
 //! RSA signing, which `std.crypto` leaves out.
 //!
-//! Zig 0.16 does ship RSA, but only half of it, and only as an implementation
+//! Zig 0.17 does ship RSA, but only half of it, and only as an implementation
 //! detail of something else: `std.crypto.Certificate.rsa` has a `PublicKey`, a
 //! PKCS#1 v1.5 verifier and a PSS verifier, because that is what checking a
 //! certificate chain needs. There is no private key type anywhere in the
@@ -82,10 +82,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const crypto = std.crypto;
 /// This library's `ff` and not `std.crypto.ff`, which is the same file with
-/// two things put right: a secret exponent of exactly three bytes taking a
-/// branchy path, and `pow` sizing its exponent buffer by the type's width
-/// rather than the modulus's. Neither is reachable from the code here --
-/// which is why they were only found by measuring something else -- but a
+/// one thing put right: `pow` sizing its exponent buffer by the type's width
+/// rather than the modulus's. It is not reachable from the code here --
+/// which is why it was only found by measuring something else -- but a
 /// library that carries the fix should be the first to use it.
 const ff = @import("ff.zig");
 const testing = std.testing;
@@ -646,11 +645,11 @@ pub const SecretKey = struct {
         // Exactly `k`, and not any shorter. `std.crypto.ff` decides between
         // its constant-time table walk and a short-exponent loop with a
         // data-dependent branch by looking at the exponent's *length*, and
-        // upstream's test for that has a precedence slip which sends a
-        // three-byte secret exponent down the branchy path. `src/ff.zig`
-        // fixes it; `k` being at least 64 here is what made it unreachable
-        // before that, and an optimisation that serialized `d` at its
-        // minimal length would not have had that guarantee.
+        // until Zig 0.17.0 its test for that had a precedence slip which sent
+        // a three-byte secret exponent down the branchy path. `k` being at
+        // least 64 here is what kept that unreachable, and an optimisation
+        // that serialized `d` at its minimal length would not have had that
+        // guarantee against the next slip of the same kind.
         var d_bytes: [max_modulus_len]u8 = undefined;
         defer crypto.secureZero(u8, d_bytes[0..k]);
         self.d.toBytes(d_bytes[0..k], .big) catch unreachable;
