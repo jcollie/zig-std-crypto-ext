@@ -275,7 +275,9 @@ library to build with it:
 $ zig fetch --save git+https://git.jcollie.dev/jeff/zig-std-crypto-ext.git#zig-0.16
 ```
 
-The `v0.1.0` tag also predates the move to 0.17 and builds with 0.16.0.
+The `v0.1.1` tag is the same thing as a fixed point. Avoid `v0.1.0`: its `ff`
+lacks the value barrier described under the carried patches, so RSA signing
+there branches on the private exponent.
 
 ```zig
 const des = @import("std_crypto_ext");
