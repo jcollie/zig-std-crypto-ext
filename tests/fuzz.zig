@@ -356,20 +356,20 @@ const xbox_seeds = blk: {
         // Too short to be a key and a nonce at all, which the property must
         // survive rather than index past.
         "",
-        "\x00" ** 55,
+        &@as([55]u8, @splat('\x00')),
         head,
         head ++ "q",
-        head ++ "q" ** 31,
-        head ++ "q" ** 32,
-        head ++ "q" ** 33,
-        head ++ "q" ** 63,
-        head ++ "q" ** 64,
-        head ++ "q" ** 65,
+        head ++ @as([31]u8, @splat('q')),
+        head ++ @as([32]u8, @splat('q')),
+        head ++ @as([33]u8, @splat('q')),
+        head ++ @as([63]u8, @splat('q')),
+        head ++ @as([64]u8, @splat('q')),
+        head ++ @as([65]u8, @splat('q')),
         // A padded DNSCrypt query, which is what this is for.
-        head ++ "a DNSCrypt query, padded to sixty-four bytes\x80" ++ "\x00" ** 19,
+        head ++ "a DNSCrypt query, padded to sixty-four bytes\x80" ++ @as([19]u8, @splat('\x00')),
         // All zeroes and all ones, both of which are real keys and nonces.
-        "\x00" ** 128,
-        "\xff" ** 128,
+        &@as([128]u8, @splat('\x00')),
+        &@as([128]u8, @splat('\xff')),
     };
 };
 
@@ -384,14 +384,14 @@ const cipher_seeds = [_][]const u8{
     "\x13\x34\x57\x79\x9b\xbc\xdf\xf1" ++ "\x01\x23\x45\x67\x89\xab\xcd\xef" ++
         "Now is the time for all ",
     // The weak keys, which are the ones a password-derived key might hit.
-    "\x01\x01\x01\x01\x01\x01\x01\x01" ++ "\x00" ** 16 ++ "\xff" ** 16,
-    "\xfe\xfe\xfe\xfe\xfe\xfe\xfe\xfe" ++ "\x00" ** 16 ++ "\x00" ** 16,
+    "\x01\x01\x01\x01\x01\x01\x01\x01" ++ @as([16]u8, @splat('\x00')) ++ @as([16]u8, @splat('\xff')),
+    "\xfe\xfe\xfe\xfe\xfe\xfe\xfe\xfe" ++ @as([16]u8, @splat('\x00')) ++ @as([16]u8, @splat('\x00')),
     // All zeroes and all ones, both of which are real keys.
-    "\x00" ** 64,
-    "\xff" ** 64,
+    &@as([64]u8, @splat('\x00')),
+    &@as([64]u8, @splat('\xff')),
     // A length that is one short of a block, for both block sizes.
-    "\x2b\x7e\x15\x16\x28\xae\xd2\xa6" ++ "\xab\xf7\x15\x88\x09\xcf\x4f\x3c" ++ "\xa5" ** 15,
-    "\x2b\x7e\x15\x16\x28\xae\xd2\xa6" ++ "\xab\xf7\x15\x88\x09\xcf\x4f\x3c" ++ "\xa5" ** 17,
+    "\x2b\x7e\x15\x16\x28\xae\xd2\xa6" ++ "\xab\xf7\x15\x88\x09\xcf\x4f\x3c" ++ @as([15]u8, @splat('\xa5')),
+    "\x2b\x7e\x15\x16\x28\xae\xd2\xa6" ++ "\xab\xf7\x15\x88\x09\xcf\x4f\x3c" ++ @as([17]u8, @splat('\xa5')),
 };
 
 // Every interesting length, at one fixed key, so `zig build test` covers the
@@ -762,11 +762,11 @@ fn cpaceProperty(input: []const u8) !void {
 const cpace_seeds = [_][]const u8{
     // Six-digit PINs with a session id and associated data, as a pairing
     // would have them; the 32 bytes after the first are a forged share.
-    "\x46" ++ ("\x09" ** 32) ++ "123456" ++ "sid-sid-sid-sid-sid-sid-" ++ "server",
-    "\x08" ++ ("\x00" ** 32) ++ "12345678",
+    "\x46" ++ @as([32]u8, @splat('\x09')) ++ "123456" ++ "sid-sid-sid-sid-sid-sid-" ++ "server",
+    "\x08" ++ @as([32]u8, @splat('\x00')) ++ "12345678",
     // The low-order points the draft lists, as the forged share.
-    "\x44" ++ "\x01" ++ ("\x00" ** 31) ++ "0000" ++ "s",
-    "\x44" ++ "\xec" ++ ("\xff" ** 30) ++ "\x7f" ++ "0000" ++ "s",
+    "\x44" ++ "\x01" ++ @as([31]u8, @splat('\x00')) ++ "0000" ++ "s",
+    "\x44" ++ "\xec" ++ @as([30]u8, @splat('\xff')) ++ "\x7f" ++ "0000" ++ "s",
 };
 
 test "fuzz cpace" {

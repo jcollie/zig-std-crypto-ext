@@ -1533,8 +1533,8 @@ test "DER that is well-formed but describes an unusable key" {
     //              INTEGER 0 x5 }
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    const n = [_]u8{0xc0} ++ [_]u8{0x01} ** 30 ++ [_]u8{0x01}; // 256 bits, odd
-    const d = [_]u8{0x11} ++ [_]u8{0x22} ** 30 ++ [_]u8{0x33};
+    const n = [_]u8{0xc0} ++ @as([30]u8, @splat(0x01)) ++ [_]u8{0x01}; // 256 bits, odd
+    const d = [_]u8{0x11} ++ @as([30]u8, @splat(0x22)) ++ [_]u8{0x33};
 
     var body: [512]u8 = undefined;
     var bw: std.Io.Writer = .fixed(&body);
@@ -1560,7 +1560,7 @@ test "DER that is well-formed but describes an unusable key" {
 test "a public exponent that is not usable is refused" {
     // e must be odd and at least 3: an even one is not coprime with n, and
     // e = 1 would make the signature the message.
-    const n = [_]u8{0xc0} ++ [_]u8{0xff} ** 126 ++ [_]u8{0x01}; // 1024 bits
+    const n = [_]u8{0xc0} ++ @as([126]u8, @splat(0xff)) ++ [_]u8{0x01}; // 1024 bits
     try testing.expectError(error.InvalidKey, PublicKey.fromBytes(&n, &.{0x01}));
     try testing.expectError(error.InvalidKey, PublicKey.fromBytes(&n, &.{0x02}));
     try testing.expectError(error.InvalidKey, PublicKey.fromBytes(&n, &.{ 0x01, 0x00, 0x00, 0x00, 0x01 }));
@@ -1569,7 +1569,7 @@ test "a public exponent that is not usable is refused" {
 }
 
 test "a modulus below the floor is refused" {
-    const short = [_]u8{0xc0} ++ [_]u8{0xff} ** 30 ++ [_]u8{0x01}; // 256 bits
+    const short = [_]u8{0xc0} ++ @as([30]u8, @splat(0xff)) ++ [_]u8{0x01}; // 256 bits
     try testing.expectError(
         error.InvalidKey,
         PublicKey.fromBytes(&short, &.{ 0x01, 0x00, 0x01 }),

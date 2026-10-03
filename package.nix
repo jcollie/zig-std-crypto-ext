@@ -5,16 +5,16 @@
   lib,
   stdenv,
   callPackage,
-  zig_0_16,
+  zig,
 }:
 let
   # Generated from build.zig.zon by zon2nix; regenerate with
-  #   nix develop -c zon2nix --16 --nix=build.zig.zon.nix build.zig.zon
-  zigDeps = callPackage ./build.zig.zon.nix { };
+  #   nix develop -c zon2nix --17 --nix=build.zig.zon.nix build.zig.zon
+  zigDeps = callPackage ./build.zig.zon.nix { zig_0_17 = zig; };
 in
 stdenv.mkDerivation {
   pname = "zig-std-crypto-ext";
-  version = "0.1.0";
+  version = "0.2.0";
 
   # Named rather than filtered, so that editing something outside this list --
   # the flake, a scratch file, a note -- does not rebuild.
@@ -33,7 +33,7 @@ stdenv.mkDerivation {
     ];
   };
 
-  nativeBuildInputs = [ zig_0_16 ];
+  nativeBuildInputs = [ zig ];
 
   # The manifest's one dependency is CPace's test vectors, a lazy one the
   # tests ask for; `--system` hands it over from the store, and forbids any
@@ -50,16 +50,16 @@ stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
     zig build docs --prefix "$out" --cache-dir "$TMPDIR/zig-cache" \
-      --global-cache-dir "$TMPDIR/zig-global-cache" --system ${zigDeps}
+      --system ${zigDeps}
     runHook postBuild
   '';
 
   checkPhase = ''
     runHook preCheck
     zig build test --summary all --cache-dir "$TMPDIR/zig-cache" \
-      --global-cache-dir "$TMPDIR/zig-global-cache" --system ${zigDeps}
+      --system ${zigDeps}
     zig build check --cache-dir "$TMPDIR/zig-cache" \
-      --global-cache-dir "$TMPDIR/zig-global-cache" --system ${zigDeps}
+      --system ${zigDeps}
     runHook postCheck
   '';
 

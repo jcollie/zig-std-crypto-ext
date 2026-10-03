@@ -343,7 +343,7 @@ test "every bit of the key matters, and every bit of the block" {
     // effect, and the known answers above would not necessarily catch it.
     var key: [24]u8 = undefined;
     for (&key, 0..) |*byte, i| byte.* = @intCast(i * 7 + 1);
-    const block = [_]u8{0xa5} ** 16;
+    const block: [16]u8 = @splat(0xa5);
 
     var baseline: [16]u8 = undefined;
     Aes192.initEnc(key).encrypt(&baseline, &block);
@@ -369,7 +369,7 @@ test "the S-box is a permutation" {
     // itself. A transcription error in a 256-entry table is the classic way
     // to get a cipher that is wrong on some inputs and right on the ones you
     // tested, and a duplicate entry is what such an error looks like.
-    var seen = [_]bool{false} ** 256;
+    var seen: [256]bool = @splat(false);
     for (sbox) |value| {
         try testing.expect(!seen[value]);
         seen[value] = true;

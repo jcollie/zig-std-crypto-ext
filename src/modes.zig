@@ -280,8 +280,9 @@ test "CBC decrypts in place" {
     // where it landed looks like. The saved chaining block is what makes this
     // work.
     const key = [_]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
-    const iv = [_]u8{0x00} ** 8;
-    var buffer = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } ** 3;
+    const iv: [8]u8 = @splat(0x00);
+    var buffer: [24]u8 = undefined;
+    for (&buffer, 0..) |*b, i| b.* = @intCast(i % 8 + 1);
     const original = buffer;
 
     cbcEncrypt(Des.EncryptCtx, Des.initEnc(key), &buffer, &buffer, iv);
@@ -327,10 +328,10 @@ test "AES-128-CFB against NIST SP 800-38A F.3.13" {
 test "CFB needs no padding" {
     // A stream mode, so a length that is not a whole number of blocks is
     // fine -- which is one fewer thing for a caller to get wrong.
-    const key = [_]u8{0x2b} ** 16;
-    const iv = [_]u8{0x11} ** 16;
+    const key: [16]u8 = @splat(0x2b);
+    const iv: [16]u8 = @splat(0x11);
     for ([_]usize{ 1, 15, 16, 17, 31, 33 }) |len| {
-        const plaintext = ([_]u8{0xa5} ** 33)[0..len];
+        const plaintext = @as([33]u8, @splat(0xa5))[0..len];
         var ciphertext: [33]u8 = undefined;
         cfbEncrypt(AesEncryptCtx(Aes128), Aes128.initEnc(key), ciphertext[0..len], plaintext, iv);
         var back: [33]u8 = undefined;
@@ -340,9 +341,10 @@ test "CFB needs no padding" {
 }
 
 test "CFB decrypts in place" {
-    const key = [_]u8{0x2b} ** 16;
-    const iv = [_]u8{0x11} ** 16;
-    var buffer = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } ** 6;
+    const key: [16]u8 = @splat(0x2b);
+    const iv: [16]u8 = @splat(0x11);
+    var buffer: [48]u8 = undefined;
+    for (&buffer, 0..) |*b, i| b.* = @intCast(i % 8 + 1);
     const original = buffer;
     cfbEncrypt(AesEncryptCtx(Aes128), Aes128.initEnc(key), &buffer, &buffer, iv);
     try testing.expect(!std.mem.eql(u8, &original, &buffer));
@@ -373,7 +375,7 @@ test "ECB is the raw cipher" {
 
     // CBC over the same input does not, because the chaining value differs.
     var chained: [16]u8 = undefined;
-    cbcEncrypt(Des.EncryptCtx, Des.initEnc(key), &chained, &repeated, [_]u8{0} ** 8);
+    cbcEncrypt(Des.EncryptCtx, Des.initEnc(key), &chained, &repeated, @as([8]u8, @splat(0)));
     try testing.expect(!std.mem.eql(u8, chained[0..8], chained[8..16]));
 }
 
@@ -416,10 +418,10 @@ test "AES-192-CFB against NIST SP 800-38A F.3.15" {
 }
 
 test "AES-192-CFB at every length, and in place" {
-    const key = [_]u8{0x3c} ** 24;
-    const iv = [_]u8{0x9e} ** 16;
+    const key: [24]u8 = @splat(0x3c);
+    const iv: [16]u8 = @splat(0x9e);
     for ([_]usize{ 1, 15, 16, 17, 31, 33, 64 }) |len| {
-        const plaintext = ([_]u8{0x5a} ** 64)[0..len];
+        const plaintext = @as([64]u8, @splat(0x5a))[0..len];
         var ciphertext: [64]u8 = undefined;
         cfbEncrypt(Aes192.EncryptCtx, Aes192.initEnc(key), ciphertext[0..len], plaintext, iv);
         var back: [64]u8 = undefined;
@@ -439,8 +441,8 @@ test "the three AES key sizes give three different ciphertexts" {
     // round-trip, so this pins that the key length actually selects the
     // cipher -- which is exactly the mistake that would make an AES-256
     // SNMPv3 session appear to work against a permissive agent.
-    const iv = [_]u8{0x11} ** 16;
-    const plaintext = [_]u8{0xa5} ** 16;
+    const iv: [16]u8 = @splat(0x11);
+    const plaintext: [16]u8 = @splat(0xa5);
     var out128: [16]u8 = undefined;
     var out192: [16]u8 = undefined;
     var out256: [16]u8 = undefined;

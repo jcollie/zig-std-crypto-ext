@@ -81,7 +81,7 @@ something has to verify the old ones in the meantime. The NT hash is MD4 [22],
 the traditional Unix `crypt` is a salted DES [21], and Argon2 hashes written
 before 2016 are version 1.0 [24]. `std` has none of the three.
 
-**RSA is here for a different reason, and it is not obsolete.** Zig 0.16 does
+**RSA is here for a different reason, and it is not obsolete.** Zig 0.17 does
 ship RSA, but only half of it and only as an implementation detail of
 something else: `std.crypto.Certificate.rsa` has a public key and a verifier
 because checking a certificate chain needs them. There is no private key type
@@ -255,9 +255,22 @@ the same answer, and the difference between them is a clock.
 
 ## Using it
 
+It needs Zig 0.17.0. The development shell and the Nix package take the
+official release binary from
+[zig-overlay](https://git.jcollie.dev/jeff/zig-overlay).
+
 ```console
 $ zig fetch --save git+https://git.jcollie.dev/jeff/zig-std-crypto-ext.git
 ```
+
+For Zig 0.16.0, use the `zig-0.16` branch, which holds the last of this
+library to build with it:
+
+```console
+$ zig fetch --save git+https://git.jcollie.dev/jeff/zig-std-crypto-ext.git#zig-0.16
+```
+
+The `v0.1.0` tag also predates the move to 0.17 and builds with 0.16.0.
 
 ```zig
 const des = @import("std_crypto_ext");
@@ -301,6 +314,7 @@ makes them genuinely generic.
 
 ```console
 $ nix develop -c zig build test --summary all
+$ nix develop -c zig build fuzz --fuzz          # Zig's fuzzer, until interrupted
 $ nix develop -c zig build fuzz-run -- --seconds 60
 $ nix develop -c zig build timing
 ```

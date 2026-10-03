@@ -175,9 +175,9 @@ test "streaming matches one shot at every split" {
 test "padding at the block boundaries" {
     // 55 bytes fit the length in the same block; 56 do not and need a second.
     // Answers from OpenSSL's legacy provider: `openssl dgst -md4`.
-    try expectHash("c889c81dd86c4d2e025778944ea02881", "a" ** 55);
-    try expectHash("d5f9a9e9257077a5f08b0b92f348b0ad", "a" ** 56);
-    try expectHash("52f5076fabd22680234a3fa9f9dc5732", "a" ** 64);
+    try expectHash("c889c81dd86c4d2e025778944ea02881", &@as([55]u8, @splat('a')));
+    try expectHash("d5f9a9e9257077a5f08b0b92f348b0ad", &@as([56]u8, @splat('a')));
+    try expectHash("52f5076fabd22680234a3fa9f9dc5732", &@as([64]u8, @splat('a')));
 }
 
 test "HMAC takes it" {
@@ -185,7 +185,7 @@ test "HMAC takes it" {
     // `openssl mac -digest md4 -macopt hexkey:0b...0b HMAC`.
     const Hmac = std.crypto.auth.hmac.Hmac(Md4);
     var out: [Hmac.mac_length]u8 = undefined;
-    Hmac.create(&out, "Hi There", &([_]u8{0x0b} ** 16));
+    Hmac.create(&out, "Hi There", &@as([16]u8, @splat(0x0b)));
     var expected: [16]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "90a79458f58f437e21f169cdba283da6");
     try testing.expectEqualSlices(u8, &expected, &out);

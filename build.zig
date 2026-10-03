@@ -75,9 +75,15 @@ pub fn build(b: *std.Build) void {
         "fuzz-filter",
         "Fuzz or test only the targets whose name contains this",
     );
+    // LLVM, because the self-hosted backend Debug uses by default emits no
+    // coverage instrumentation: under it the fuzzer's table of program
+    // counters comes back empty and `--fuzz` fails in the build runner rather
+    // than fuzzing anything. `build.zig` cannot see whether `--fuzz` was
+    // passed, so it is always on.
     const fuzz_tests = b.addTest(.{
         .root_module = fuzz_mod,
         .filters = if (fuzz_filter) |f| &.{f} else &.{},
+        .use_llvm = true,
     });
     test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
@@ -87,10 +93,10 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "The fuzz targets: add --fuzz to fuzz them");
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
-    // The loop that drives those same targets without Zig's fuzzer, which
-    // this toolchain cannot usefully run: `tools/fuzz.zig` says why, and the
-    // short version is that the coverage table comes back empty. Optimised,
-    // because a fuzzer's whole job is how many inputs it gets through, and
+    // The loop that drives those same targets without Zig's fuzzer: no
+    // coverage feedback, but the same run on every machine for a given seed,
+    // which is what CI wants. `tools/fuzz.zig` says more. Optimised, because
+    // a fuzzer's whole job is how many inputs it gets through, and
     // ReleaseSafe keeps every check that makes a failure a failure.
     const fuzz_run = b.addExecutable(.{
         .name = "zig-std-crypto-ext-fuzz",
@@ -103,7 +109,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_fuzz = b.addRunArtifact(fuzz_run);
     run_fuzz.stdio = .inherit;
-    if (b.args) |a| run_fuzz.addArgs(a);
+    run_fuzz.addPassthruArgs();
     const fuzz_run_step = b.step("fuzz-run", "Fuzz the targets with a loop of our own");
     fuzz_run_step.dependOn(&run_fuzz.step);
 
@@ -137,7 +143,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_timing = b.addRunArtifact(timing);
     run_timing.stdio = .inherit;
-    if (b.args) |a| run_timing.addArgs(a);
+    run_timing.addPassthruArgs();
     const timing_step = b.step("timing", "Measure that the cipher and key helpers are constant-time");
     timing_step.dependOn(&run_timing.step);
     // Its statistics have tests of their own, and the check step keeps it
@@ -181,7 +187,7 @@ pub fn build(b: *std.Build) void {
 
     const run_docs_server = b.addRunArtifact(docs_server);
     run_docs_server.step.dependOn(&install_docs.step);
-    run_docs_server.addArg(b.getInstallPath(.prefix, "docs"));
+    run_docs_server.addDirectoryArg(library.getEmittedDocs());
     run_docs_server.addArg(b.fmt("{d}", .{docs_port}));
     // The server runs until interrupted, so its output has to reach the
     // terminal rather than being captured by the build runner.

@@ -255,7 +255,7 @@ const s_boxes_packed = blk: {
 /// `table` names distinct bits of an `in_bits` wide value, and the bits it
 /// leaves out are exactly `omitted`. With nothing omitted it is a permutation.
 fn checkSelection(comptime name: []const u8, comptime table: []const u8, comptime in_bits: usize, comptime omitted: []const u8) void {
-    var seen = [_]bool{false} ** (in_bits + 1);
+    var seen: [in_bits + 1]bool = @splat(false);
     for (table) |bit| {
         if (bit < 1 or bit > in_bits) @compileError(name ++ ": entry out of range");
         if (seen[bit]) @compileError(name ++ ": repeats a bit");
@@ -279,7 +279,7 @@ comptime {
 
     // E names every bit of the 32, and doubles exactly the ones either side of
     // each four-bit group: bit 4n and bit 4n+1.
-    var times = [_]u8{0} ** 33;
+    var times: [33]u8 = @splat(0);
     for (expansion) |bit| {
         if (bit < 1 or bit > 32) @compileError("E: entry out of range");
         times[bit] += 1;
@@ -302,7 +302,7 @@ comptime {
     // Each S-box row is a permutation of 0..15, as printed.
     for (s_boxes_published) |box| {
         for (0..4) |row| {
-            var seen = [_]bool{false} ** 16;
+            var seen: [16]bool = @splat(false);
             for (box[row * 16 ..][0..16]) |v| {
                 if (v > 15) @compileError("S-box entry out of range");
                 if (seen[v]) @compileError("S-box row repeats a value");
@@ -666,8 +666,8 @@ test "the all-zero and all-ones keys and blocks" {
     // Two of the oldest vectors in circulation, checked against OpenSSL like
     // the rest. An earlier draft attributed them to Rivest's paper, which
     // they are not from; his test is the next one.
-    try expectBlock(Des, &([_]u8{0x00} ** 8), 0x0000000000000000, 0x8ca64de9c1b123a7);
-    try expectBlock(Des, &([_]u8{0xff} ** 8), 0xffffffffffffffff, 0x7359b2163e4edc58);
+    try expectBlock(Des, &@as([8]u8, @splat(0x00)), 0x0000000000000000, 0x8ca64de9c1b123a7);
+    try expectBlock(Des, &@as([8]u8, @splat(0xff)), 0xffffffffffffffff, 0x7359b2163e4edc58);
 }
 
 test "Rivest's cycle" {
@@ -766,14 +766,14 @@ test "parity helpers" {
     // The FIPS key is distributed with odd parity, as DES keys conventionally
     // are.
     try testing.expect(hasOddParity(&.{ 0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1 }));
-    try testing.expect(!hasOddParity(&([_]u8{0x00} ** 8)));
+    try testing.expect(!hasOddParity(&@as([8]u8, @splat(0x00))));
     // An even byte anywhere, not only first.
     try testing.expect(!hasOddParity(&.{ 0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf0 }));
 
-    var key = [_]u8{0x00} ** 8;
+    var key: [8]u8 = @splat(0x00);
     setOddParity(&key);
     try testing.expect(hasOddParity(&key));
-    try testing.expectEqualSlices(u8, &([_]u8{0x01} ** 8), &key);
+    try testing.expectEqualSlices(u8, &@as([8]u8, @splat(0x01)), &key);
     // And every byte value, both ways round.
     for (0..256) |v| {
         var byte = [1]u8{@intCast(v)};
@@ -801,7 +801,7 @@ test "the weak keys are involutions" {
     // Parity is ignored when deciding, so the all-zero key is the all-ones
     // parity spelling of the first weak key, and each of the others has an
     // even-parity spelling too.
-    try testing.expect(isWeak([_]u8{0x00} ** 8));
+    try testing.expect(isWeak(@as([8]u8, @splat(0x00))));
     for (weak_keys) |key| {
         var respelled = key;
         for (&respelled) |*byte| byte.* ^= 1;

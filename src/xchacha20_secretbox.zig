@@ -259,7 +259,7 @@ test "libsodium's crypto_secretbox_xchacha20poly1305_easy, 64 bytes" {
     // A padded DNSCrypt query, which is what this is for: the message is 64
     // bytes, so it spans the block that also holds the Poly1305 key and one
     // whole block after it.
-    const message = "a DNSCrypt query, padded to sixty-four bytes\x80" ++ "\x00" ** 19;
+    const message = "a DNSCrypt query, padded to sixty-four bytes\x80" ++ @as([19]u8, @splat('\x00'));
     try testing.expectEqual(@as(usize, 64), message.len);
 
     const expected: [80]u8 = .{
@@ -324,7 +324,7 @@ test "this is not the RFC 8439 AEAD that std exports" {
     // message, two constructions, and a program that picks the wrong one
     // produces something no libsodium peer will open -- with no error to
     // notice, because both encrypt perfectly well.
-    const message = "a DNSCrypt query, padded to sixty-four bytes\x80" ++ "\x00" ** 19;
+    const message = "a DNSCrypt query, padded to sixty-four bytes\x80" ++ @as([19]u8, @splat('\x00'));
     const Ietf = crypto.aead.chacha_poly.XChaCha20Poly1305;
 
     var ours: [80]u8 = undefined;
@@ -376,8 +376,8 @@ test "libsodium's crypto_box_curve25519xchacha20poly1305_beforenm" {
 
     // The public keys are libsodium's too, so this also checks that `std`'s
     // X25519 base point multiplication agrees with `crypto_scalarmult_base`.
-    try testing.expectEqualSlices(u8, &client_pk, &(try X25519.recoverPublicKey(client_sk)));
-    try testing.expectEqualSlices(u8, &resolver_pk, &(try X25519.recoverPublicKey(resolver_sk)));
+    try testing.expectEqualSlices(u8, &client_pk, &X25519.recoverPublicKey(client_sk));
+    try testing.expectEqualSlices(u8, &resolver_pk, &X25519.recoverPublicKey(resolver_sk));
 
     const from_client = try Box.createSharedSecret(resolver_pk, client_sk);
     const from_resolver = try Box.createSharedSecret(client_pk, resolver_sk);
@@ -411,7 +411,7 @@ test "a box round-trips at every length across the block boundaries" {
 }
 
 test "every byte of a box is authenticated, and so are the key and the nonce" {
-    const message = "sixty-four bytes of padded DNS query, more or less" ++ "\x80" ** 15;
+    const message = "sixty-four bytes of padded DNS query, more or less" ++ @as([15]u8, @splat('\x80'));
     var box: [message.len + SecretBox.tag_length]u8 = undefined;
     SecretBox.seal(&box, message, test_nonce, test_key);
 

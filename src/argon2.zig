@@ -86,8 +86,8 @@ fn initHash(
     mem.writeInt(u32, parameters[4..8], @as(u32, @intCast(dk_len)), .little);
     mem.writeInt(u32, parameters[8..12], params.m, .little);
     mem.writeInt(u32, parameters[12..16], params.t, .little);
-    mem.writeInt(u32, parameters[16..20], @intFromEnum(version), .little);
-    mem.writeInt(u32, parameters[20..24], @intFromEnum(mode), .little);
+    mem.writeInt(u32, parameters[16..20], @backingInt(version), .little);
+    mem.writeInt(u32, parameters[20..24], @backingInt(mode), .little);
     b2.update(&parameters);
     mem.writeInt(u32, &tmp, @as(u32, @intCast(password.len)), .little);
     b2.update(&tmp);
@@ -253,16 +253,16 @@ fn processSegment(
     slice: u32,
     lane: u24,
 ) void {
-    var addresses align(16) = [_]u64{0} ** block_length;
-    var in align(16) = [_]u64{0} ** block_length;
-    const zero align(16) = [_]u64{0} ** block_length;
+    var addresses: [block_length]u64 align(16) = @splat(0);
+    var in: [block_length]u64 align(16) = @splat(0);
+    const zero: [block_length]u64 align(16) = @splat(0);
     if (mode == .argon2i or (mode == .argon2id and n == 0 and slice < sync_points / 2)) {
         in[0] = n;
         in[1] = lane;
         in[2] = slice;
         in[3] = memory;
         in[4] = passes;
-        in[5] = @intFromEnum(mode);
+        in[5] = @backingInt(mode);
     }
     var index: u32 = 0;
     if (n == 0 and slice == 0) {
@@ -530,9 +530,9 @@ test "both versions against the reference implementation" {
 
 test "version 1.3 agrees with std, secret and associated data included" {
     // The RFC 9106 section 5 inputs, which exercise every field of H0.
-    const password = [_]u8{0x01} ** 32;
-    const salt = [_]u8{0x02} ** 16;
-    const params: Params = .{ .t = 3, .m = 32, .p = 4, .secret = &([_]u8{0x03} ** 8), .ad = &([_]u8{0x04} ** 12) };
+    const password: [32]u8 = @splat(0x01);
+    const salt: [16]u8 = @splat(0x02);
+    const params: Params = .{ .t = 3, .m = 32, .p = 4, .secret = &@as([8]u8, @splat(0x03)), .ad = &@as([12]u8, @splat(0x04)) };
     for ([_]Mode{ .argon2d, .argon2i, .argon2id }) |mode| {
         var ours: [32]u8 = undefined;
         var theirs: [32]u8 = undefined;

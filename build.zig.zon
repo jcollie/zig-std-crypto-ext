@@ -1,8 +1,8 @@
 .{
     .name = .std_crypto_ext,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0xa03576c1e17069ce, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .cpace_draft = .{
             .url = "git+https://github.com/cfrg/draft-irtf-cfrg-cpace#8fb4056e1b9201927d9f651b9970d9d5660c7892",
