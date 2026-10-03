@@ -108,10 +108,12 @@ pub const xchacha20_secretbox = @import("xchacha20_secretbox.zig");
 /// a player with a server over it.
 pub const cpace = @import("cpace.zig");
 
-/// `std.crypto.ff` with one function put right.
+/// `std.crypto.ff` with three things put right.
 ///
 /// The only thing here that is not an addition to the standard library but a
-/// correction to it: `Modulus.pow` sized its exponent buffer by the type's
+/// correction to it. Two are timing leaks, the worse of them that its
+/// constant-time selects compile, under LLVM, to branches on the secret
+/// exponent. The third: `Modulus.pow` sized its exponent buffer by the type's
 /// maximum width rather than the modulus's, and the ladder spends four
 /// squarings on every nibble it is given -- so a 2048-bit key under the
 /// `Modulus(4096)` an RSA implementation needs for 4096-bit keys did twice

@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
 // SPDX-License-Identifier: MIT
 //
-// Vendored from Zig 0.16.0's `lib/std/crypto/ff.zig` and changed in one
-// place. See the note below, and `README.md` for the measurements.
+// Vendored from Zig 0.16.0's `lib/std/crypto/ff.zig` and changed in three
+// places. See the note below, and `README.md` for the measurements.
 
 //! Allocation-free, (best-effort) constant-time, finite field arithmetic for large integers.
 //!
@@ -13,8 +13,25 @@
 //! Parts of that code was ported from the BSD-licensed crypto/internal/bigmod/nat.go file in the Go language, itself inspired from BearSSL.
 //! ## What is changed from the standard library
 //!
-//! Two things, in two functions. One is a timing leak; the other is half the
-//! work of every RSA signature.
+//! Three things. Two are timing leaks; the other is half the work of every
+//! RSA signature.
+//!
+//! ### A branch on every nibble of the secret exponent
+//!
+//! `ct_protected.select` builds its mask from a `bool` the optimizer can see
+//! through, and `eql` hands it that `bool`. LLVM turns the selection into a
+//! branch, so the window-table lookup and the conditional multiply in
+//! `powWithEncodedExponentInternal` branch on each nibble of the exponent.
+//! An empty `asm` statement that the mask passes through hides it from the
+//! optimizer, which is the whole fix. It is ziglang/zig#37023, fixed the same
+//! way by ziglang/zig#37025.
+//!
+//! Valgrind's memcheck shows it, with the exponent marked undefined: without
+//! the barrier it reports branches on the exponent reached from the table
+//! lookup and the multiply, and with it none. `zig build timing` does not
+//! see it under 0.16.0, which compiles the branch into something too small
+//! for a t-test to find at these sample counts; under 0.17.0 it reports
+//! |t| of 20 to 60.
 //!
 //! ### A secret exponent down the branchy path
 //!
@@ -73,7 +90,7 @@
 //! where they differ and the widths where they should not, and
 //! `zig build timing` checks the first change with a clock.
 //!
-//! This is a carried patch and not a fork: the intent is that it goes
+//! These are carried patches and not a fork: the intent is that they go
 //! upstream and this file then goes away.
 //!
 
@@ -975,12 +992,25 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
     };
 }
 
+// Hides `x` from the optimizer, so that it cannot reason about where it came
+// from. Without it LLVM sees that `select`'s mask is all ones or all zeros
+// and branches on the condition instead -- on the secret exponent, in
+// `powWithEncodedExponentInternal`. The C backend has no inline assembly and
+// comptime needs none.
+fn valueBarrier(x: Limb) Limb {
+    if (@inComptime() or builtin.zig_backend == .stage2_c) return x;
+    return asm (""
+        : [ret] "=r" (-> Limb),
+        : [x] "0" (x),
+    );
+}
+
 const ct = if (std.options.side_channels_mitigations == .none) ct_unprotected else ct_protected;
 
 const ct_protected = struct {
     // Returns x if on is true, otherwise y.
     fn select(on: bool, x: Limb, y: Limb) Limb {
-        const mask = @as(Limb, 0) -% @intFromBool(on);
+        const mask = valueBarrier(@as(Limb, 0) -% @intFromBool(on));
         return y ^ (mask & (y ^ x));
     }
 
