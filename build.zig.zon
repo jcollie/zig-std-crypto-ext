@@ -1,6 +1,6 @@
 .{
     .name = .std_crypto_ext,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0xa03576c1e17069ce, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

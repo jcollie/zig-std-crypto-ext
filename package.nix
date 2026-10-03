@@ -14,7 +14,7 @@ let
 in
 stdenv.mkDerivation {
   pname = "zig-std-crypto-ext";
-  version = "0.0.0";
+  version = "0.1.0";
 
   # Named rather than filtered, so that editing something outside this list --
   # the flake, a scratch file, a note -- does not rebuild.
